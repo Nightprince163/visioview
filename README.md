@@ -24,7 +24,13 @@
 
 ### 直接使用
 
-从 Releases 下载 `VisioView.exe`，双击运行即可。**单文件、自包含**，不需要预装 .NET 运行时。
+到 [**Releases**](../../releases) 页面下载最新版的 `VisioView.exe`，双击运行即可。
+**单文件、自包含**，不需要预装 .NET 运行时，也不需要安装。
+
+> 首次运行时 Windows SmartScreen 可能提示「无法识别的应用」，因为程序未做代码签名。
+> 点「更多信息」→「仍要运行」即可。
+>
+> 如果只是想先看看效果，也可以按下面的说明自行编译，两分钟搞定。
 
 ### 注册文件关联
 
@@ -46,6 +52,34 @@
 ```bash
 dotnet publish src/VisioView/VisioView.csproj -c Release -r win-x64 --self-contained true \
   -p:PublishSingleFile=true -p:IncludeNativeLibrariesForSelfExtract=true -p:EnableCompressionInSingleFile=true
+```
+
+## 发布新版本
+
+可执行文件**不进仓库**（单文件约 65 MB，入库会让仓库无限膨胀），统一通过 GitHub Releases 分发。
+
+1. 本地编译：
+
+   ```powershell
+   .\publish.ps1
+   ```
+
+2. 打 tag 并推送：
+
+   ```bash
+   git tag v1.0.0
+   git push origin v1.0.0
+   ```
+
+3. 在 GitHub 上 **Releases → Draft a new release**，选择刚推的 tag，
+   把 `publish\VisioView.exe` 拖进附件区发布。
+
+装了 [GitHub CLI](https://cli.github.com/) 的话，第 3 步可以合并成一条命令：
+
+```bash
+gh release create v1.0.0 `
+  "src/VisioView/bin/Release/net10.0-windows/win-x64/publish/VisioView.exe" `
+  --title "VisioView v1.0.0" --notes "首个可下载版本"
 ```
 
 ## 项目结构

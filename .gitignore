@@ -7,11 +7,9 @@ publish/
 *.pdb
 *.cache
 TestResults/
-[Dd]ebug/
-[Rr]elease/
 .vs/
 
-# ── 发布/安装包产物 ───────────────────────────────────────
+# ── 发布产物（走 GitHub Releases 分发，不入库） ───────────
 *.exe
 *.zip
 *.msi
