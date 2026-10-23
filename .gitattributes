@@ -1,0 +1,11 @@
+# 行尾规范化：避免 Windows 上提交时整文件 diff
+* text=auto
+
+*.cs       text eol=lf
+*.xaml     text eol=lf
+*.csproj   text eol=lf
+*.slnx     text eol=lf
+*.md       text eol=lf
+
+*.ps1      text eol=crlf
+*.iss      text eol=crlf

@@ -1,0 +1,29 @@
+# ── 构建产物 ──────────────────────────────────────────────
+bin/
+obj/
+publish/
+*.user
+*.suo
+*.pdb
+*.cache
+TestResults/
+[Dd]ebug/
+[Rr]elease/
+.vs/
+
+# ── 发布/安装包产物 ───────────────────────────────────────
+*.exe
+*.zip
+*.msi
+installer/out/
+
+# ── 本机样本与私有数据（不对外发布） ──────────────────────
+/战略经营管理.vsdx
+/testdata
+/tools
+/.workbuddy
+
+# ── 系统垃圾 ──────────────────────────────────────────────
+Thumbs.db
+desktop.ini
+.DS_Store

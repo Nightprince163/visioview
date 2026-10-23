@@ -1,0 +1,53 @@
+﻿<Window x:Class="VisioView.MainWindow"
+        xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
+        xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+        xmlns:local="clr-namespace:VisioView"
+        Title="VisioView" Height="720" Width="1100">
+    <DockPanel>
+        <Menu DockPanel.Dock="Top">
+            <MenuItem Header="文件(_F)">
+                <MenuItem Header="打开 .vsdx (_O)" Click="Open_Click"/>
+                <Separator/>
+                <MenuItem Header="设为默认打开程序(_S)" Click="Register_Click"/>
+                <MenuItem Header="取消文件关联(_U)" Click="Unregister_Click"/>
+                <Separator/>
+                <MenuItem Header="退出(_X)" Click="Exit_Click"/>
+            </MenuItem>
+            <MenuItem Header="帮助(_H)">
+                <MenuItem Header="关于" Click="About_Click"/>
+            </MenuItem>
+        </Menu>
+
+        <ToolBar DockPanel.Dock="Top" Name="ToolBar1">
+            <Button Content="适应窗口" Click="Fit_Click" Padding="6,2"/>
+            <Button Content="实际大小" Click="Actual_Click" Padding="6,2"/>
+            <Separator/>
+            <Button Content="−" Click="ZoomOut_Click" Width="28" FontWeight="Bold"/>
+            <TextBlock Name="ZoomLabel" Text="100%" VerticalAlignment="Center" Width="48" TextAlignment="Center"/>
+            <Button Content="+" Click="ZoomIn_Click" Width="28" FontWeight="Bold"/>
+            <Separator/>
+            <TextBlock Text="页面:" VerticalAlignment="Center" Margin="6,0,2,0"/>
+            <ComboBox Name="PageCombo" Width="160" SelectionChanged="PageCombo_SelectionChanged" DisplayMemberPath="Name"/>
+            <Separator/>
+            <TextBlock Name="InfoLabel" VerticalAlignment="Center" Margin="8,0,0,0" Foreground="#555"/>
+        </ToolBar>
+
+        <StatusBar DockPanel.Dock="Bottom">
+            <StatusBarItem>
+                <TextBlock Name="StatusText" Text="未打开文件。可将 .vsdx 文件拖入窗口，或点击「文件 → 打开」。"/>
+            </StatusBarItem>
+        </StatusBar>
+
+        <Border Name="Viewport" Background="#EDEDED" ClipToBounds="True"
+                AllowDrop="True" Drop="Viewport_Drop" DragOver="Viewport_DragOver">
+            <Canvas Name="SceneCanvas" Background="White">
+                <Canvas.RenderTransform>
+                    <TransformGroup>
+                        <ScaleTransform x:Name="ScaleT" ScaleX="96" ScaleY="96"/>
+                        <TranslateTransform x:Name="TransT" X="0" Y="0"/>
+                    </TransformGroup>
+                </Canvas.RenderTransform>
+            </Canvas>
+        </Border>
+    </DockPanel>
+</Window>

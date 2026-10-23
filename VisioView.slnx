@@ -1,0 +1,8 @@
+<Solution>
+  <Folder Name="/src/">
+    <Project Path="src/VisioView.Core/VisioView.Core.csproj" />
+    <Project Path="src/VisioView.Render.Svg/VisioView.Render.Svg.csproj" />
+    <Project Path="src/VisioView.Tests/VisioView.Tests.csproj" />
+    <Project Path="src/VisioView/VisioView.csproj" />
+  </Folder>
+</Solution>
