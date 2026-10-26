@@ -1,10 +1,10 @@
-; VisioView 安装脚本（Inno Setup）
+﻿; VisioView 安装脚本（Inno Setup）
 ; 用法：用 Inno Setup 打开本文件并编译，需先执行 publish.ps1 生成单文件 exe。
 ; 安装程序会以机器级（HKLM）注册 .vsdx 文件关联（需要管理员权限）。
 
 [Setup]
 AppName=VisioView
-AppVersion=1.0.0
+AppVersion=1.1.0
 AppPublisher=VisioView
 DefaultDirName={autopf}\VisioView
 DefaultGroupName=VisioView

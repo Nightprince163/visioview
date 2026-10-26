@@ -10,6 +10,7 @@
 - **查看** `.vsdx` 文件，多页切换
 - **缩放 / 平移 / 适应窗口**
 - **双击打开**：注册 `.vsdx` 文件关联后，资源管理器里双击直接打开
+- **导出图片**：PNG / JPEG，可选「整页画布」或「仅内容区域」，支持 1×–4× 分辨率与透明背景
 - **接近 Visio 的渲染效果**：
   - 形状几何（`MoveTo` / `LineTo` / `RelMoveTo` / `RelLineTo` / `ArcTo` / `EllipticalArcTo` / `Ellipse` / `PolylineTo` / `NURBSTo`）
   - 填充与描边（含 `FillPattern`、`NoFill`、`NoLine`、`NoShow` 语义）
@@ -90,6 +91,28 @@ gh release create v1.0.0 `
 | `src/VisioView.Render.Svg` | SVG 渲染后端（用于比对与调试） |
 | `src/VisioView` | WPF 主程序，画布渲染与交互 |
 | `src/VisioView.Tests` | 命令行回归工具，把每一页导出为 SVG |
+
+## 导出图片
+
+`文件 → 导出图片…`（或 `Ctrl+E`），可以选：
+
+| 选项 | 说明 |
+| --- | --- |
+| 格式 | **PNG**（无损、可保留透明背景）/ **JPEG**（体积小，适合照片类底图） |
+| 导出范围 | **整页画布**：按 Visio 页面尺寸导出，四周空白保留<br>**仅内容区域**：裁到图形实际占据的边界，去掉四周空白 |
+| 缩放 | 1×（96 DPI）～ 4×（384 DPI），对话框里实时显示输出像素尺寸 |
+| 透明背景 | 仅 PNG 有效，适合贴到深色背景或 PPT 上 |
+
+「仅内容区域」的边界取的是**实际渲染结果**（含文字、旋转文字、图片、描边）的包围盒，
+不是按形状坐标估算，所以裁切位置是准的。
+
+命令行也能导出，便于批量处理：
+
+```bash
+# 参数：<vsdx> <输出> [页号] [full|content] [缩放倍数] [alpha]
+VisioView.exe --export 你的文件.vsdx out.png 1 content 2
+VisioView.exe --export 你的文件.vsdx out.jpg 2 full 3
+```
 
 ## 调试
 

@@ -1,4 +1,4 @@
-# 发布 VisioView 为 Windows x64 自包含单文件 exe。
+﻿# 发布 VisioView 为 Windows x64 自包含单文件 exe。
 # 用法（PowerShell）：  .\publish.ps1
 $ErrorActionPreference = "Stop"
 

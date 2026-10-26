@@ -7,6 +7,7 @@
         <Menu DockPanel.Dock="Top">
             <MenuItem Header="文件(_F)">
                 <MenuItem Header="打开 .vsdx (_O)" Click="Open_Click"/>
+                <MenuItem Header="导出图片(_E)…" Click="Export_Click" InputGestureText="Ctrl+E"/>
                 <Separator/>
                 <MenuItem Header="设为默认打开程序(_S)" Click="Register_Click"/>
                 <MenuItem Header="取消文件关联(_U)" Click="Unregister_Click"/>

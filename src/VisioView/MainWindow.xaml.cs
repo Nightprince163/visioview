@@ -13,6 +13,7 @@ public partial class MainWindow : Window
 {
     private Scene? _scene;
     private int _currentPage = 0;
+    private string _sourcePath = "";
     private double _zoom = 1.0;       // 1 = 实际大小（1 英寸 = 96px）
     private double _tx = 0, _ty = 0;
 
@@ -28,6 +29,16 @@ public partial class MainWindow : Window
         Viewport.MouseMove += Viewport_MouseMove;
         Viewport.MouseLeftButtonUp += Viewport_MouseLeftButtonUp;
         Viewport.MouseLeave += (_, _) => { if (_panning) EndPan(); };
+
+        // Ctrl+E 导出图片（InputGestureText 只负责显示，实际按键在这里接）
+        PreviewKeyDown += (_, e) =>
+        {
+            if (e.Key == Key.E && Keyboard.Modifiers == ModifierKeys.Control)
+            {
+                Export_Click(this, new RoutedEventArgs());
+                e.Handled = true;
+            }
+        };
     }
 
     // ---------------- 文件加载 ----------------
@@ -45,6 +56,7 @@ public partial class MainWindow : Window
             PageCombo.ItemsSource = _scene.Pages;
             PageCombo.SelectedIndex = 0;
             _currentPage = 0;
+            _sourcePath = path;
             RenderPage();
             // 标题：未打开文件时为 "VisioView"，打开后为 "文件名 - VisioView"
             var fileName = System.IO.Path.GetFileName(path);
@@ -173,6 +185,74 @@ public partial class MainWindow : Window
         if (dlg.ShowDialog() == true) LoadFile(dlg.FileName);
     }
 
+    // ---------------- 导出图片 ----------------
+
+    private void Export_Click(object sender, RoutedEventArgs e)
+    {
+        if (_scene == null)
+        {
+            MessageBox.Show("请先打开一个 .vsdx 文件。", "提示", MessageBoxButton.OK, MessageBoxImage.Information);
+            return;
+        }
+
+        var page = _scene.Pages[_currentPage];
+
+        Canvas arranged;
+        try
+        {
+            arranged = ImageExporter.BuildArranged(page);
+        }
+        catch (System.Exception ex)
+        {
+            MessageBox.Show($"准备导出时出错：\n{ex.Message}", "错误", MessageBoxButton.OK, MessageBoxImage.Error);
+            return;
+        }
+
+        var dlg = new ExportDialog(page, arranged) { Owner = this };
+        if (dlg.ShowDialog() != true) return;
+
+        bool isPng = dlg.Format == ExportFormat.Png;
+        var sfd = new SaveFileDialog
+        {
+            Title = "导出图片",
+            Filter = isPng ? "PNG 图片 (*.png)|*.png" : "JPEG 图片 (*.jpg;*.jpeg)|*.jpg;*.jpeg",
+            DefaultExt = isPng ? ".png" : ".jpg",
+            AddExtension = true,
+            FileName = DefaultImageName(isPng),
+        };
+        if (sfd.ShowDialog() != true) return;
+
+        var (w, h) = ImageExporter.PredictSize(page, dlg.Range, dlg.Scale, arranged);
+        try
+        {
+            ImageExporter.Export(page, arranged, sfd.FileName, dlg.Format, dlg.Range, dlg.Scale, dlg.Transparent);
+            StatusText.Text = $"已导出：{System.IO.Path.GetFileName(sfd.FileName)}（{w} × {h} px）";
+
+            if (MessageBox.Show($"已导出到：\n{sfd.FileName}\n\n尺寸 {w} × {h} px。是否打开所在文件夹？",
+                    "导出完成", MessageBoxButton.YesNo, MessageBoxImage.Information) == MessageBoxResult.Yes)
+            {
+                System.Diagnostics.Process.Start("explorer.exe", $"/select,\"{sfd.FileName}\"");
+            }
+        }
+        catch (System.Exception ex)
+        {
+            MessageBox.Show($"导出失败：\n{ex.Message}", "错误", MessageBoxButton.OK, MessageBoxImage.Error);
+        }
+    }
+
+    private string DefaultImageName(bool isPng)
+    {
+        var name = System.IO.Path.GetFileNameWithoutExtension(_sourcePath);
+        if (string.IsNullOrEmpty(name)) name = "VisioView";
+        if (_scene != null && _scene.Pages.Count > 1) name += $"_P{_currentPage + 1}";
+
+        // 文件名里不能出现 \ / : * ? " < > | 这些字符
+        foreach (var c in System.IO.Path.GetInvalidFileNameChars())
+            name = name.Replace(c, '_');
+
+        return name + (isPng ? ".png" : ".jpg");
+    }
+
     private void Register_Click(object sender, RoutedEventArgs e)
     {
         try
@@ -208,7 +288,8 @@ public partial class MainWindow : Window
             "VisioView — .vsdx 查看器\n\n" +
             "· 双击 .vsdx 直接打开（需先「设为默认打开程序」）\n" +
             "· 滚轮缩放，拖拽平移，工具栏可适应窗口 / 实际大小\n" +
-            "· 支持多页切换、形状/连线/文本渲染", "关于 VisioView",
+            "· 支持多页切换、形状/连线/文本渲染\n" +
+            "· 可导出 PNG / JPEG（Ctrl+E），支持整页或仅内容区域", "关于 VisioView",
             MessageBoxButton.OK, MessageBoxImage.Information);
     }
 

@@ -12,7 +12,12 @@
     <UseWPF>true</UseWPF>
     <AssemblyTitle>VisioView</AssemblyTitle>
     <AssemblyName>VisioView</AssemblyName>
-    <ApplicationDisplayName>Visio 查看器</ApplicationDisplayName>
+    <ApplicationDisplayName>VisioView</ApplicationDisplayName>
+    <Product>VisioView</Product>
+    <Description>轻量 .vsdx（Visio）查看器，支持导出 PNG / JPEG</Description>
+    <Version>1.1.0</Version>
+    <FileVersion>1.1.0.0</FileVersion>
+    <AssemblyVersion>1.1.0.0</AssemblyVersion>
     <RootNamespace>VisioView</RootNamespace>
   </PropertyGroup>
 
