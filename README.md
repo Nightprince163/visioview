@@ -11,6 +11,7 @@
 - **缩放 / 平移 / 适应窗口**
 - **双击打开**：注册 `.vsdx` 文件关联后，资源管理器里双击直接打开
 - **导出图片**：PNG / JPEG，可选「整页画布」或「仅内容区域」，支持 1×–4× 分辨率与透明背景
+- **在线升级**：启动后静默检查 GitHub Releases，发现新版本可一键下载替换并自动重启
 - **接近 Visio 的渲染效果**：
   - 形状几何（`MoveTo` / `LineTo` / `RelMoveTo` / `RelLineTo` / `ArcTo` / `EllipticalArcTo` / `Ellipse` / `PolylineTo` / `NURBSTo`）
   - 填充与描边（含 `FillPattern`、`NoFill`、`NoLine`、`NoShow` 语义）
@@ -113,6 +114,34 @@ gh release create v1.0.0 `
 VisioView.exe --export 你的文件.vsdx out.png 1 content 2
 VisioView.exe --export 你的文件.vsdx out.jpg 2 full 3
 ```
+
+## 在线升级
+
+不需要服务器：程序直接向 GitHub Releases 查询最新版本，免费且没有流量限制。
+
+- **自动**：启动 3 秒后静默检查一次，有新版本只在状态栏右下角显示一行提示，不弹窗、不打断。
+- **手动**：`帮助 → 检查更新`。
+- 确认升级后，程序下载新包 → 校验 SHA256 → 替换自身 → 自动重启（会把你当前打开的文件一并带上）。
+
+更新源默认为本仓库的 Releases API，可用环境变量指向镜像或自建静态接口：
+
+```bash
+VV_UPDATE_FEED=https://your-mirror.example.com/releases/latest VisioView.exe
+```
+
+排查用：
+
+```bash
+# 只查不下载；带第二个参数则下载并校验
+VisioView.exe --check-update
+VisioView.exe --check-update out.exe
+```
+
+几个已知限制：
+
+- **程序所在目录必须可写**。放在 `Program Files` 下会因权限不足而失败，程序会明确提示；放到桌面或用户目录即可。
+- 下载的是**完整包**（约 62 MB），没有增量更新。
+- 程序未做代码签名，新版本首次运行仍会被 SmartScreen 提示一次，与升级机制无关。
 
 ## 调试
 

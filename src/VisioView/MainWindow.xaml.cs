@@ -39,7 +39,101 @@ public partial class MainWindow : Window
                 e.Handled = true;
             }
         };
+
+        UpdateChecker.CleanupOld();   // 清掉上次升级残留的 .old 文件
+        Loaded += OnWindowLoaded;
     }
+
+    // ---------------- 在线升级 ----------------
+
+    private UpdateInfo? _pendingUpdate;
+
+    /// <summary>启动后延迟几秒静默查一次，失败绝不打扰用户。</summary>
+    private async void OnWindowLoaded(object sender, RoutedEventArgs e)
+    {
+        try
+        {
+            await Task.Delay(TimeSpan.FromSeconds(3));
+            await CheckUpdateAsync(manual: false);
+        }
+        catch { /* 网络不可用、被墙、超时都静默忽略 */ }
+    }
+
+    private void CheckUpdate_Click(object sender, RoutedEventArgs e)
+        => _ = CheckUpdateAsync(manual: true);
+
+    private void UpdateLink_Click(object sender, RoutedEventArgs e)
+    {
+        if (_pendingUpdate != null) _ = CheckUpdateAsync(manual: true);
+    }
+
+    private async Task CheckUpdateAsync(bool manual)
+    {
+        if (manual) StatusText.Text = "正在检查更新…";
+
+        try
+        {
+            var info = await UpdateChecker.CheckAsync();
+
+            if (info == null)
+            {
+                if (manual) MessageBox.Show("更新源返回的内容无法解析，请稍后再试。", "检查更新",
+                    MessageBoxButton.OK, MessageBoxImage.Warning);
+                return;
+            }
+
+            if (!UpdateChecker.IsNewer(info.Version))
+            {
+                UpdateLink.Visibility = Visibility.Collapsed;
+                _pendingUpdate = null;
+                if (manual)
+                    MessageBox.Show($"当前已是最新版本（{UpdateChecker.CurrentVersion}）。", "检查更新",
+                        MessageBoxButton.OK, MessageBoxImage.Information);
+                return;
+            }
+
+            _pendingUpdate = info;
+            UpdateLinkRun.Text = $"发现新版本 {info.Version}，点此升级";
+            UpdateLink.Visibility = Visibility.Visible;
+
+            if (!manual) return;   // 后台检查只挂提示，不弹窗
+
+            var notes = string.IsNullOrWhiteSpace(info.Notes) ? "" : Trim(info.Notes!, 400) + "\n\n";
+            var r = MessageBox.Show(
+                $"发现新版本 {info.Version}（当前 {UpdateChecker.CurrentVersion}）。\n\n{notes}" +
+                "是否立即下载并升级？升级完成后程序会自动重启。",
+                "发现新版本", MessageBoxButton.YesNo, MessageBoxImage.Information);
+
+            if (r == MessageBoxResult.Yes) await RunUpdateAsync(info);
+        }
+        catch (Exception ex)
+        {
+            if (manual)
+                MessageBox.Show($"检查更新失败：\n{ex.Message}\n\n" +
+                                "常见原因是网络无法访问 github.com，可稍后重试。",
+                    "检查更新", MessageBoxButton.OK, MessageBoxImage.Warning);
+        }
+    }
+
+    private async Task RunUpdateAsync(UpdateInfo info)
+    {
+        var win = new UpdateWindow(info) { Owner = this };
+        win.ShowDialog();
+
+        if (string.IsNullOrEmpty(win.DownloadedPath)) return;   // 取消或失败
+
+        // 重启后把当前打开的文件一并带上，用户不必再找一遍
+        if (!UpdateChecker.Apply(win.DownloadedPath, _sourcePath, out var err))
+        {
+            MessageBox.Show($"升级失败：\n{err}", "更新失败", MessageBoxButton.OK, MessageBoxImage.Error);
+            return;
+        }
+
+        Application.Current.Shutdown();
+    }
+
+    private static string Trim(string s, int max)
+        => s.Length <= max ? s : s[..max].TrimEnd() + "…";
 
     // ---------------- 文件加载 ----------------
 
@@ -285,11 +379,12 @@ public partial class MainWindow : Window
     private void About_Click(object sender, RoutedEventArgs e)
     {
         MessageBox.Show(
-            "VisioView — .vsdx 查看器\n\n" +
+            $"VisioView {UpdateChecker.CurrentVersion} — .vsdx 查看器\n\n" +
             "· 双击 .vsdx 直接打开（需先「设为默认打开程序」）\n" +
             "· 滚轮缩放，拖拽平移，工具栏可适应窗口 / 实际大小\n" +
             "· 支持多页切换、形状/连线/文本渲染\n" +
-            "· 可导出 PNG / JPEG（Ctrl+E），支持整页或仅内容区域", "关于 VisioView",
+            "· 可导出 PNG / JPEG（Ctrl+E），支持整页或仅内容区域\n" +
+            "· 在线升级：帮助 → 检查更新", "关于 VisioView",
             MessageBoxButton.OK, MessageBoxImage.Information);
     }
 

@@ -1,0 +1,14 @@
+<Window x:Class="VisioView.UpdateWindow"
+        xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
+        xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+        Title="下载更新" Width="440" SizeToContent="Height"
+        WindowStartupLocation="CenterOwner" ResizeMode="NoResize"
+        ShowInTaskbar="False" FontSize="13">
+    <StackPanel Margin="18,16,18,14">
+        <TextBlock Name="TitleText" Text="正在下载新版本…" FontWeight="SemiBold"/>
+        <ProgressBar Name="Bar" Height="16" Minimum="0" Maximum="1" Margin="0,12,0,8"/>
+        <TextBlock Name="DetailText" Text="" Foreground="#888" FontSize="12"/>
+        <Button Name="CancelBtn" Content="取消" Width="88" Height="30"
+                HorizontalAlignment="Right" Margin="0,16,0,0" Click="Cancel_Click"/>
+    </StackPanel>
+</Window>

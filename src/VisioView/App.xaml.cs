@@ -71,6 +71,48 @@ public partial class App : Application
             return;
         }
 
+        // 诊断模式：--check-update [保存路径] —— 查询更新源，可选下载并校验
+        if (args.Length > 0 && args[0].Equals("--check-update", System.StringComparison.OrdinalIgnoreCase))
+        {
+            var log = "update-check.txt";
+            try
+            {
+                var info = System.Threading.Tasks.Task.Run(() => UpdateChecker.CheckAsync())
+                    .GetAwaiter().GetResult();
+                if (info == null)
+                {
+                    System.IO.File.WriteAllText(log, "null（更新源内容无法解析）");
+                    Shutdown(1);
+                    return;
+                }
+
+                var sb = new System.Text.StringBuilder();
+                sb.AppendLine($"当前版本 {UpdateChecker.CurrentVersion}");
+                sb.AppendLine($"最新版本 {info.Version}（tag {info.Tag}）");
+                sb.AppendLine($"有新版本 {UpdateChecker.IsNewer(info.Version)}");
+                sb.AppendLine($"附件 {info.AssetName}  {info.Size} 字节");
+                sb.AppendLine($"SHA256 {info.Sha256 ?? "(未提供)"}");
+                sb.AppendLine($"下载地址 {info.DownloadUrl}");
+
+                if (args.Length >= 2)
+                {
+                    var path = System.Threading.Tasks.Task.Run(() => UpdateChecker.DownloadAsync(info))
+                        .GetAwaiter().GetResult();
+                    System.IO.File.Move(path, args[1], true);
+                    sb.AppendLine($"下载成功 {args[1]}  {new System.IO.FileInfo(args[1]).Length} 字节（校验通过）");
+                }
+
+                System.IO.File.WriteAllText(log, sb.ToString());
+                Shutdown(0);
+            }
+            catch (System.Exception ex)
+            {
+                System.IO.File.WriteAllText(log, "ERR " + ex);
+                Shutdown(1);
+            }
+            return;
+        }
+
         var win = new MainWindow();
 
         // 双击 .vsdx 打开：第一个参数是文件路径
