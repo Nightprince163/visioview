@@ -15,9 +15,9 @@
     <ApplicationDisplayName>VisioView</ApplicationDisplayName>
     <Product>VisioView</Product>
     <Description>轻量 .vsdx（Visio）查看器，支持导出 PNG / JPEG</Description>
-    <Version>1.1.0</Version>
-    <FileVersion>1.1.0.0</FileVersion>
-    <AssemblyVersion>1.1.0.0</AssemblyVersion>
+    <Version>1.2.0</Version>
+    <FileVersion>1.2.0.0</FileVersion>
+    <AssemblyVersion>1.2.0.0</AssemblyVersion>
     <RootNamespace>VisioView</RootNamespace>
   </PropertyGroup>
 
