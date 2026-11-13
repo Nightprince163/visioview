@@ -93,6 +93,11 @@ public static class WpfRenderer
                     fig?.Segments.Add(new QuadraticBezierSegment(
                         new Point(q.Cx, q.Cy), new Point(q.X, q.Y), true));
                     break;
+                case _Cubic cb:
+                    fig?.Segments.Add(new BezierSegment(
+                        new Point(cb.C1x, cb.C1y), new Point(cb.C2x, cb.C2y),
+                        new Point(cb.X, cb.Y), true));
+                    break;
                 case _Close:
                     if (fig != null) fig.IsClosed = true;
                     break;

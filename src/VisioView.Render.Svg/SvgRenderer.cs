@@ -50,6 +50,9 @@ public static class SvgRenderer
                 case _Quad q:
                     d.Append($"Q{q.Cx:0.####} {q.Cy:0.####} {q.X:0.####} {q.Y:0.####} ");
                     break;
+                case _Cubic cb:
+                    d.Append($"C{cb.C1x:0.####} {cb.C1y:0.####} {cb.C2x:0.####} {cb.C2y:0.####} {cb.X:0.####} {cb.Y:0.####} ");
+                    break;
                 case _Ellipse e:
                     d.Append($"M{e.X - e.Rx:0.###} {e.Y:0.###} ");
                     d.Append($"A{e.Rx:0.###} {e.Ry:0.###} 0 1 1 {e.X + e.Rx:0.###} {e.Y:0.###} ");

@@ -110,6 +110,16 @@ public class _Quad : ILowCmd
     public _Quad(double cx, double cy, double x, double y) { Cx = cx; Cy = cy; X = x; Y = y; }
 }
 
+/// <summary>三次贝塞尔：用于 Visio 的 NURBSTo 曲线连接线（控制点由 E 单元格的 NURBS(...) 还原）。</summary>
+public class _Cubic : ILowCmd
+{
+    public double C1x, C1y, C2x, C2y, X, Y;
+    public _Cubic(double c1x, double c1y, double c2x, double c2y, double x, double y)
+    {
+        C1x = c1x; C1y = c1y; C2x = c2x; C2y = c2y; X = x; Y = y;
+    }
+}
+
 public class _Ellipse : ILowCmd
 {
     public double X, Y, Rx, Ry;

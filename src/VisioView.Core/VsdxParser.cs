@@ -285,8 +285,13 @@ public static class VsdxParser
     }
 
     /// <summary>
-    /// 把页面内容包围盒平移到原点，并将页面尺寸设为内容尺寸（取与文件声明尺寸的最大值）。
-    /// 这样无论文件里 PageWidth/Height 是否准确，页面都能正确框住全部图形。
+    /// 规整页面：页面尺寸取「文件声明尺寸」与「内容包围盒 + 边距」的较大者，
+    /// 再把内容包围盒居中放进画布。
+    ///
+    /// 旧实现是把包围盒左上角平移到原点（内容永远贴左上）。对只占页面中间一小块的图
+    /// （如 1_v2.vsdx：A4 横向页面里只画了三组示意图）就会看到图形挤在左上角、右下方
+    /// 一大片空白。居中后既保留原始页面尺寸（"整页导出"与"仅内容导出"仍有区别），
+    /// 也让图形落在画布中央。
     /// </summary>
     private static void NormalizePage(PageScene page)
     {
@@ -295,6 +300,7 @@ public static class VsdxParser
         bool any = false;
         foreach (var d in page.Drawables)
         {
+            if (!d.HasBounds) continue;
             if (d.MinX < minX) minX = d.MinX;
             if (d.MinY < minY) minY = d.MinY;
             if (d.MaxX > maxX) maxX = d.MaxX;
@@ -303,7 +309,24 @@ public static class VsdxParser
         }
         if (!any) return;
 
-        double ox = minX, oy = minY;
+        const double margin = 0.25;   // 内容超出声明页面时至少留的边距（英寸）
+        double cw = maxX - minX, ch = maxY - minY;
+        double pw = Math.Max(page.Width, cw + margin * 2);
+        double ph = Math.Max(page.Height, ch + margin * 2);
+        // 目标：内容包围盒的中心落在画布中心
+        double ox = (pw - cw) / 2 - minX;
+        double oy = (ph - ch) / 2 - minY;
+        if (Trace)
+            Console.Error.WriteLine($"[page] content=({minX:0.###},{minY:0.###})-({maxX:0.###},{maxY:0.###}) " +
+                                    $"size=({cw:0.###},{ch:0.###}) declared=({page.Width:0.###},{page.Height:0.###}) " +
+                                    $"final=({pw:0.###},{ph:0.###}) shift=({ox:0.###},{oy:0.###})");
+
+        if (Math.Abs(ox) < 1e-9 && Math.Abs(oy) < 1e-9)
+        {
+            page.Width = pw; page.Height = ph;
+            return;
+        }
+
         foreach (var d in page.Drawables)
         {
             if (d is PathDrawable p)
@@ -312,26 +335,32 @@ public static class VsdxParser
                 {
                     switch (c)
                     {
-                        case _Move m: m.X -= ox; m.Y -= oy; break;
-                        case _Line l: l.X -= ox; l.Y -= oy; break;
-                        case _Arc a: a.X -= ox; a.Y -= oy; break;
-                        case _Quad q: q.Cx -= ox; q.Cy -= oy; q.X -= ox; q.Y -= oy; break;
-                        case _Ellipse e: e.X -= ox; e.Y -= oy; break;
+                        case _Move m: m.X += ox; m.Y += oy; break;
+                        case _Line l: l.X += ox; l.Y += oy; break;
+                        case _Arc a: a.X += ox; a.Y += oy; break;
+                        case _Quad q: q.Cx += ox; q.Cy += oy; q.X += ox; q.Y += oy; break;
+                        case _Cubic cu:
+                            cu.C1x += ox; cu.C1y += oy; cu.C2x += ox; cu.C2y += oy;
+                            cu.X += ox; cu.Y += oy; break;
+                        case _Ellipse e: e.X += ox; e.Y += oy; break;
                     }
                 }
             }
             else if (d is TextDrawable t)
             {
-                t.CenterX -= ox; t.CenterY -= oy;
+                t.CenterX += ox; t.CenterY += oy;
             }
             else if (d is ImageDrawable im)
             {
-                im.X -= ox; im.Y -= oy;
+                im.X += ox; im.Y += oy;
             }
-            d.MinX -= ox; d.MinY -= oy; d.MaxX -= ox; d.MaxY -= oy;
+            if (d.HasBounds)
+            {
+                d.MinX += ox; d.MinY += oy; d.MaxX += ox; d.MaxY += oy;
+            }
         }
-        page.Width = Math.Max(maxX - minX, page.Width);
-        page.Height = Math.Max(maxY - minY, page.Height);
+        page.Width = pw;
+        page.Height = ph;
     }
 
     /// <summary>
@@ -398,8 +427,32 @@ public static class VsdxParser
             // 容器/泳道的标题条要贴着这个实例的顶边（Visio 里标题条不随容器拉高而变厚）。
             var prevTop = _headingTopScreen;
             _headingTopScreen = page.Height - (pinY + iH / 2);
-            foreach (var child in mdef.ShapesRoot.Elements().Where(e => e.Name.LocalName == "Shape"))
-                RenderMasterContent(child, M, masters, page, instStyle, mid, kidText);
+
+            // 实例自带完整几何时，优先用实例几何 + 抵消掉母版缩放。
+            //
+            // Visio 会把实例化后的几何按「实例本地坐标」缓存进实例的 V 值，而母版几何是
+            // 「母版本地坐标」、靠 M 里的 sx/sy 缩放。对「只依赖 Width 的偏移量」两者结果不同：
+            // 圆角矩形的圆角半径来自 Width*0.1 —— 母版里是 0.1575，乘 sy=0.415 后只剩 0.0654，
+            // 于是正圆角被压成扁椭圆（肉眼就是 45° 斜切）；而实例缓存里 X、Y 两个方向都是
+            // 0.1258，正是 Visio 显示的正圆。用实例几何并把缩放抵消（M∘Scale(1/sx,1/sy)），
+            // 本地坐标重新按实例英寸计算，圆角恢复成正圆，其余比例几何结果不变。
+            bool usedInstGeom = false;
+            if (mrootEl != null && sx > 1e-9 && sy > 1e-9 &&
+                !IsHeadingShape(mrootEl) && !HasHeadingChild(mdef) &&
+                mrootEl.Elements().FirstOrDefault(e => e.Name.LocalName == "Shapes") == null &&
+                HasCompleteInstanceGeometry(shape, mrootEl))
+            {
+                var MNoScale = Affine.Compose(M, new Affine(1 / sx, 0, 0, 1 / sy, 0, 0));
+                RenderGeometry(shape, MNoScale, instStyle, page, mrootEl);
+                usedInstGeom = true;
+                if (Trace)
+                    Console.Error.WriteLine($"  [geom-src] ID={shape.Attribute("ID")?.Value} 用实例几何（抵消 sx/sy）");
+            }
+            if (!usedInstGeom)
+            {
+                foreach (var child in mdef.ShapesRoot.Elements().Where(e => e.Name.LocalName == "Shape"))
+                    RenderMasterContent(child, M, masters, page, instStyle, mid, kidText);
+            }
             _headingTopScreen = prevTop;
 
             var mroot = mdef.ShapesRoot.Elements().FirstOrDefault(e => e.Name.LocalName == "Shape");
@@ -584,9 +637,170 @@ public static class VsdxParser
         return dTB <= dLR;
     }
 
+    // ---------------- NURBS 曲线连接线 ----------------
+
+    /// <summary>
+    /// 解析 NURBSTo 行 E 单元格的 NURBS(...) 函数，还原控制点（本形状本地坐标，英寸）。
+    /// 形式：NURBS(knot, degree, xType, yType, x1,y1,z1,w1, x2,y2,z2,w2, ...)
+    /// xType/yType = 0 表示坐标按 Width/Height 归一化（0..1），非 0 表示已是本地英寸。
+    /// 实测 1_v2.vsdx：宽度为正的连接线 x 归一化、宽度为负（翻转）的 x 为绝对值；
+    /// y 一律归一化，正好解释了 y 值随 Height 反比变化但绝对高度恒为 3.75mm 的现象。
+    /// </summary>
+    private static List<(double X, double Y)> ParseNurbsPoints(XElement row, double w, double h)
+    {
+        var res = new List<(double X, double Y)>();
+        var cell = row.Elements().FirstOrDefault(c =>
+            c.Name.LocalName == "Cell" && (string?)c.Attribute("N") == "E");
+        var raw = (string?)cell?.Attribute("V") ?? (string?)cell?.Attribute("F");
+        if (string.IsNullOrEmpty(raw)) return res;
+
+        var nums = new List<double>();
+        foreach (Match m in Regex.Matches(raw!, @"-?\d+(?:\.\d+)?(?:[eE][-+]?\d+)?"))
+            if (double.TryParse(m.Value, NF, CultureInfo.InvariantCulture, out var d)) nums.Add(d);
+        if (nums.Count < 8) return res;      // 头部 4 个 + 至少 1 组 4 个
+
+        double xType = nums[2], yType = nums[3];
+        for (int i = 4; i + 3 < nums.Count; i += 4)
+        {
+            double x = nums[i], y = nums[i + 1];
+            if (Math.Abs(xType) < 0.5) x *= w;
+            if (Math.Abs(yType) < 0.5) y *= h;
+            res.Add((x, y));
+        }
+        return res;
+    }
+
+    /// <summary>
+    /// 曲线连接线渲染。Visio 的 1-D 形状 Geometry 以 Begin 点为本地原点，
+    /// (Width, Height) 恰好对应 End 点，因此本地坐标 → 页面坐标只需平移 Begin。
+    /// 用 NURBS 控制点拟合一条三次贝塞尔（端点严格落在 End 上），再按曲线末端切线补箭头。
+    /// 返回 false 表示不是曲线连接线，调用方继续走普通连接线逻辑。
+    /// </summary>
+    private static bool TryRenderNurbsConnector(
+        XElement shape, XElement? inh, Affine parentM, Style style, PageScene page)
+    {
+        double? bx = GetDimNullable(shape, "BeginX", inh);
+        double? by = GetDimNullable(shape, "BeginY", inh);
+        if (bx == null || by == null) return false;
+
+        double w = GetDim(shape, "Width", inh, 0);
+        double h = GetDim(shape, "Height", inh, 0);
+
+        foreach (var sec in shape.Elements().Where(e =>
+                     e.Name.LocalName == "Section" &&
+                     ((string?)e.Attribute("N") ?? "").StartsWith("Geometry", StringComparison.Ordinal)))
+        {
+            // NoShow=1 的几何段不画
+            if (sec.Elements().Any(c => c.Name.LocalName == "Cell" &&
+                                        (string?)c.Attribute("N") == "NoShow" &&
+                                        (string?)c.Attribute("V") == "1")) continue;
+
+            var rows = sec.Elements().Where(e => e.Name.LocalName == "Row").ToList();
+            for (int i = 0; i < rows.Count; i++)
+            {
+                var row = rows[i];
+                if (((string?)row.Attribute("T") ?? "") != "NURBSTo") continue;
+                var pts = ParseNurbsPoints(row, w, h);
+                if (pts.Count == 0) continue;
+
+                // 起点：前面最近的 MoveTo / RelMoveTo，缺省 (0,0)
+                double sx0 = 0, sy0 = 0;
+                for (int j = i - 1; j >= 0; j--)
+                {
+                    var t = (string?)rows[j].Attribute("T") ?? "";
+                    if (t != "MoveTo" && t != "RelMoveTo") continue;
+                    sx0 = RowDim(rows[j], "X", shape, 0, null);
+                    sy0 = RowDim(rows[j], "Y", shape, 0, null);
+                    if (t == "RelMoveTo") { sx0 *= w; sy0 *= h; }
+                    break;
+                }
+                double ex = RowDim(row, "X", shape, w, null);
+                double ey = RowDim(row, "Y", shape, h, null);
+
+                (double X, double Y) S(double lx, double ly)
+                {
+                    var p = parentM.Apply(bx.Value + lx, by.Value + ly);
+                    return (p.X, page.Height - p.Y);
+                }
+
+                var s = S(sx0, sy0);
+                var e = S(ex, ey);
+                // 三次贝塞尔：P1 取首个控制点（决定起点切线），P2 取倒数第二个控制点
+                // （决定入线方向），P3 严格用行的 X/Y 端点。控制点全在同一侧，拟合出
+                // Visio 那种"先竖直/水平走一小段再平滑拐弯"的弧线，不会出现直角折线。
+                var p1 = S(pts[0].X, pts[0].Y);
+                var p2 = S(pts[pts.Count >= 2 ? pts.Count - 2 : 0].X,
+                           pts[pts.Count >= 2 ? pts.Count - 2 : 0].Y);
+
+                string color = style.LineColor ?? "#000000";
+                double lw = style.LineWeight.HasValue && style.LineWeight.Value > 0
+                    ? style.LineWeight.Value : 0.0139;
+                bool noLine = style.LinePattern == 0;
+
+                if (!noLine)
+                {
+                    var curve = new PathDrawable
+                    {
+                        Fill = null, Stroke = color, StrokeWidth = lw, NoFill = true,
+                    };
+                    curve.Commands.Add(new _Move(s.X, s.Y));
+                    curve.Commands.Add(new _Cubic(p1.X, p1.Y, p2.X, p2.Y, e.X, e.Y));
+                    // 贝塞尔曲线整体在控制点凸包内，用控制点求包围盒足够安全
+                    curve.Include(s.X, s.Y);
+                    curve.Include(e.X, e.Y);
+                    foreach (var q in pts)
+                    {
+                        var t = S(q.X, q.Y);
+                        curve.Include(t.X, t.Y);
+                    }
+                    page.Drawables.Add(curve);
+
+                    int arrow = (int)Math.Round(GetDim(shape, "EndArrow", inh, 0));
+                    if (arrow != 0)
+                    {
+                        // 箭头方向取曲线末端切线（p2 → 终点），拐弯后才不会指歪
+                        double adx = e.X - p2.X, ady = e.Y - p2.Y;
+                        double alen = Math.Sqrt(adx * adx + ady * ady);
+                        if (alen < 1e-9)
+                        {
+                            adx = e.X - s.X; ady = e.Y - s.Y;
+                            alen = Math.Sqrt(adx * adx + ady * ady);
+                        }
+                        if (alen > 1e-9)
+                        {
+                            double ux = adx / alen, uy = ady / alen;
+                            double ah = Math.Max(0.10, lw * 9);
+                            double aw = ah * 0.45;
+                            double bxx = e.X - ux * ah, byy = e.Y - uy * ah;
+                            double nx = -uy, ny = ux;
+                            var tri = new PathDrawable
+                            {
+                                Fill = color, Stroke = color, StrokeWidth = lw * 0.4, NoFill = false,
+                            };
+                            tri.Commands.Add(new _Move(e.X, e.Y));
+                            tri.Commands.Add(new _Line(bxx + nx * aw, byy + ny * aw));
+                            tri.Commands.Add(new _Line(bxx - nx * aw, byy - ny * aw));
+                            tri.Commands.Add(new _Close());
+                            tri.Include(e.X, e.Y);
+                            tri.Include(bxx + nx * aw, byy + ny * aw);
+                            tri.Include(bxx - nx * aw, byy - ny * aw);
+                            page.Drawables.Add(tri);
+                        }
+                    }
+                }
+                return true;   // 已按曲线连接线处理
+            }
+        }
+        return false;
+    }
+
     private static bool TryRenderConnector(
         XElement shape, XElement? inh, Affine parentM, Style style, PageScene page)
     {
+        // 曲线连接线：作者选了 Visio 的"曲线"走线，真实路径写在自身 Geometry 的 NURBSTo 里。
+        // Begin/End 只是端点，绝不能再套直角路由把曲线折成直角的横平竖直折线。
+        if (TryRenderNurbsConnector(shape, inh, parentM, style, page)) return true;
+
         double? bx = GetDimNullable(shape, "BeginX", inh);
         double? by = GetDimNullable(shape, "BeginY", inh);
         double? ex = GetDimNullable(shape, "EndX", inh);
@@ -915,11 +1129,28 @@ public static class VsdxParser
                         break;
                     case "ArcTo":
                     {
-                        double ex = RowDim(row, "X", shape, 0, mrow), ey = RowDim(row, "Y", shape, 0, mrow);
-                        double ang = RowDim(row, "A", shape, Math.PI / 2, mrow);
-                        var arc = MakeArc(curX, curY, ex, ey, ang);
+                        double ex = RowDim(row, "X", shape, 0, mrow);
+                        double ey = RowDim(row, "Y", shape, 0, mrow);
+                        // Visio 的 A 是「弦高（矢高）」：弧中点到弦中点的距离。
+                        // 圆角矩形的圆角半径 r 对应 A = r*(1-cos45°) = 0.2929r，
+                        // 母版里正是 A=User.xxxOffset*0.2929 —— 所以它不是半径、更不是夹角。
+                        double sag = RowDim(row, "A", shape, 0, mrow);
                         ToScreen(ex, ey, out var ax, out var ay);
-                        path.Commands.Add(new _Arc(ax, ay, arc.Rx * kx, arc.Ry * ky, 0, arc.LargeArc, arc.Sweep));
+                        ToScreen(curX, curY, out var asx, out var asy);
+                        if (TryArcFromSagitta(curX, curY, ex, ey, sag,
+                                              out var rr, out var ccx, out var ccy, out var la))
+                        {
+                            // 扫掠方向：把圆心一起投到屏幕坐标，用叉积定号。
+                            // 这样 Y 轴翻转、负 Width/Height 的镜像、非等比缩放都不用手工推符号。
+                            var cp = M.Apply(ccx, ccy);
+                            double scx = cp.X, scy = page.Height - cp.Y;
+                            double cross = (asx - scx) * (ay - scy) - (asy - scy) * (ax - scx);
+                            path.Commands.Add(new _Arc(ax, ay, rr * kx, rr * ky, 0, la, cross > 0));
+                        }
+                        else
+                        {
+                            path.Commands.Add(new _Line(ax, ay));   // 弦高≈0 时退化成直线
+                        }
                         curX = ex; curY = ey;
                         break;
                     }
@@ -946,14 +1177,36 @@ public static class VsdxParser
                         path.Commands.Add(new _Ellipse(ccx, ccy, rx * kx, ry * ky));
                         break;
                     }
+                    case "NURBSTo":
+                    {
+                        // 非连接线形状上的 NURBS 曲线（连接线已由 TryRenderNurbsConnector 接管）。
+                        double ex = RowDim(row, "X", shape, curX, mrow);
+                        double ey = RowDim(row, "Y", shape, curY, mrow);
+                        var pts = ParseNurbsPoints(row, gw, gh);
+                        if (pts.Count > 0)
+                        {
+                            var q1 = pts[0];
+                            var q2 = pts[pts.Count >= 2 ? pts.Count - 2 : 0];
+                            ToScreen(q1.X, q1.Y, out var c1x, out var c1y);
+                            ToScreen(q2.X, q2.Y, out var c2x, out var c2y);
+                            ToScreen(ex, ey, out var nx, out var ny);
+                            path.Commands.Add(new _Cubic(c1x, c1y, c2x, c2y, nx, ny));
+                        }
+                        else
+                        {
+                            ToScreen(ex, ey, out var fx2, out var fy2);
+                            path.Commands.Add(new _Line(fx2, fy2));
+                        }
+                        curX = ex; curY = ey;
+                        break;
+                    }
                     case "InfiniteLine":
                     case "PolylineTo":
-                    case "NURBSTo":
                     case "SplineStart":
                     case "SplineKnot":
                         double fx = RowDim(row, "X", shape, curX, mrow), fy = RowDim(row, "Y", shape, curY, mrow);
-                        ToScreen(fx, fy, out var fx2, out var fy2);
-                        path.Commands.Add(new _Line(fx2, fy2));
+                        ToScreen(fx, fy, out var fx2b, out var fy2b);
+                        path.Commands.Add(new _Line(fx2b, fy2b));
                         curX = fx; curY = fy;
                         break;
                     default:
@@ -977,6 +1230,7 @@ public static class VsdxParser
                 case _Line l: l.Y += dy; break;
                 case _Arc a: a.Y += dy; break;
                 case _Quad q: q.Cy += dy; q.Y += dy; break;
+                case _Cubic cu: cu.C1y += dy; cu.C2y += dy; cu.Y += dy; break;
                 case _Ellipse e: e.Y += dy; break;
             }
         }
@@ -984,35 +1238,39 @@ public static class VsdxParser
         p.MaxY += dy;
     }
 
-    private static _Arc MakeArc(double sx, double sy, double ex, double ey, double ang, double? fixedR = null)
+    /// <summary>
+    /// 由 Visio ArcTo 的（起点、终点、A=弦高/矢高）还原圆弧的半径、圆心与大弧标志。
+    ///
+    /// A 的语义是「弧中点到弦中点的距离」（sagitta），不是半径、也不是圆弧夹角：
+    /// 90° 圆角半径 r 的矢高恰好是 r*(1-cos45°)=0.2929r，母版里写的就是
+    /// `A = User.xxxOffset * 0.2929`，可反推 r = 0.1575in，正是圆角半径。
+    ///
+    /// 旧实现把 A 当夹角算 r = d/(2*sin(A/2))，A=0.046rad 只有 2.6°，
+    /// 于是半径被算成 4.8in —— 弧几乎是直线，圆角就被拉成了 45° 斜切。
+    ///
+    /// 半径公式：r = (d²/4 + h²)/(2|h|)。
+    /// A 带符号：正值表示弧凸向弦的右侧（Visio 坐标系 Y 轴向上，即 u 顺时针转 90° 方向）。
+    /// </summary>
+    private static bool TryArcFromSagitta(double sx, double sy, double ex, double ey, double sagitta,
+        out double r, out double cx, out double cy, out bool largeArc)
     {
+        r = 0; cx = 0; cy = 0; largeArc = false;
         double dx = ex - sx, dy = ey - sy;
         double d = Math.Sqrt(dx * dx + dy * dy);
-        double r;
-        bool largeArc, sweep;
-        if (fixedR.HasValue)
-        {
-            r = Math.Max(fixedR.Value, d / 2);
-            double half = d / (2 * r);
-            if (half > 1) half = 1;
-            double a = 2 * Math.Asin(half);
-            largeArc = a > Math.PI;
-            sweep = true;
-        }
-        else
-        {
-            if (d < 1e-9) r = 1e-6;
-            else
-            {
-                double aa = Math.Abs(ang);
-                if (aa < 1e-6) aa = Math.PI / 2;
-                r = Math.Abs(d / (2 * Math.Sin(aa / 2)));
-            }
-            if (double.IsInfinity(r) || r > 1e6) r = 1e6;
-            largeArc = Math.Abs(ang) > Math.PI;
-            sweep = ang > 0;
-        }
-        return new _Arc(ex, ey, r, r, 0, largeArc, sweep);
+        double ah = Math.Abs(sagitta);
+        if (d < 1e-9 || ah < 1e-9) return false;      // 退化：按直线处理
+
+        r = (d * d / 4 + ah * ah) / (2 * ah);
+        if (double.IsInfinity(r) || double.IsNaN(r) || r > 1e6) return false;
+
+        double ux = dx / d, uy = dy / d;
+        double nx = uy, ny = -ux;                      // 弦方向顺时针转 90° = 矢高凸起方向
+        double mx = (sx + ex) / 2, my = (sy + ey) / 2;
+        double off = Math.Sign(sagitta) * (r - ah);    // 圆心在凸起的反方向
+        cx = mx - nx * off;
+        cy = my - ny * off;
+        largeArc = ah > d / 2;                         // 矢高超过半弦长 → 大于半圆
+        return true;
     }
 
     /// <summary>
@@ -1032,10 +1290,18 @@ public static class VsdxParser
         }
         if (string.IsNullOrEmpty(text)) return;
 
-        double w = GetDim(shape, "Width", inh, 0);
-        double h = GetDim(shape, "Height", inh, 0);
-        double tx = GetDim(shape, "TxtPinX", inh, w / 2);
-        double ty = GetDim(shape, "TxtPinY", inh, h / 2);
+        // ownM 把「本地坐标」映射到页面坐标。母版实例时这个本地坐标系是**母版根形状**
+        // 的坐标系（母版 Width/Height），不是实例 Width/Height：母版几何也是按母版坐标画的，
+        // 再由 M 缩放。旧代码用实例 W/2、H/2 当缺省 TxtPin 喂给 M，等于把实例尺寸当母版尺寸，
+        // 于是文字按缩放比整体偏离形状中心（1_v2.vsdx 所有黄色节点文字都偏左下约 0.13in）。
+        // 因此：缺省锚点必须用 ownM 所对应的坐标系（inh ?? shape）的中心。
+        var frame = inh ?? shape;
+        double frameW = GetDim(frame, "Width", null, 0);
+        double frameH = GetDim(frame, "Height", null, 0);
+        double ownW = GetDim(shape, "Width", null, 0);
+        double ownH = GetDim(shape, "Height", null, 0);
+        double tx = ResolveTextPin(shape, frame, "TxtPinX", frameW, ownW, frameW / 2);
+        double ty = ResolveTextPin(shape, frame, "TxtPinY", frameH, ownH, frameH / 2);
         var c = ownM.Apply(tx, ty);
         double sx = c.X, sy = page.Height - c.Y;
 
@@ -1073,6 +1339,44 @@ public static class VsdxParser
         td.Include(sx - estW / 2, sy - estH / 2);
         td.Include(sx + estW / 2, sy + estH / 2);
         page.Drawables.Add(td);
+    }
+
+    /// <summary>
+    /// 求文字锚点（返回 ownM 所映射坐标系里的值）。
+    /// - 单元格写在实例上：V 是「实例本地坐标」，要按 frameSize/ownSize 换算到母版坐标系。
+    /// - 单元格只写在母版上（F='Inh' / 缺失）：V 已经是母版坐标系，直接用。
+    /// - 两边都没有：用该坐标系的中心。
+    /// </summary>
+    private static double ResolveTextPin(XElement shape, XElement frame, string name,
+        double frameSize, double ownSize, double def)
+    {
+        if (TryCellNumber(shape, name, out var v))
+        {
+            if (!ReferenceEquals(shape, frame) && Math.Abs(ownSize) > 1e-9 && Math.Abs(frameSize) > 1e-9)
+                return v * (frameSize / ownSize);
+            return v;
+        }
+        if (TryCellNumber(frame, name, out var mv)) return mv;
+        return def;
+    }
+
+    /// <summary>读取单元格的数值缓存（F='Inh' 视为"没有"，交给上级继承）。</summary>
+    private static bool TryCellNumber(XElement? el, string name, out double v)
+    {
+        v = 0;
+        var c = el?.Elements().FirstOrDefault(x =>
+            x.Name.LocalName == "Cell" && (string?)x.Attribute("N") == name);
+        if (c == null) return false;
+        var f = (string?)c.Attribute("F");
+        if (f == "Inh" || f == "INH") return false;
+        var s = (string?)c.Attribute("V");
+        if (s != null && double.TryParse(s, NF, CultureInfo.InvariantCulture, out v)) return true;
+        if (f != null && el != null)
+        {
+            var ev = EvalFormula(f, el, null);
+            if (ev.HasValue) { v = ev.Value; return true; }
+        }
+        return false;
     }
 
     /// <summary>按底色明暗选对比色：深底用白字、浅底用黑字。</summary>
@@ -1389,6 +1693,29 @@ public static class VsdxParser
         if (inh == null) return null;
         return inh.Elements().FirstOrDefault(e =>
             e.Name.LocalName == "Section" && (string?)e.Attribute("N") == name);
+    }
+
+    /// <summary>
+    /// 实例是否带有「完整」几何：母版里每个 Geometry 段在实例里都有同名段，且实例段的行数
+    /// 不少于母版段。少行说明实例只做了局部覆盖（其余靠继承），此时必须走母版几何。
+    /// </summary>
+    private static bool HasCompleteInstanceGeometry(XElement shape, XElement mroot)
+    {
+        static bool IsGeom(XElement e) => e.Name.LocalName == "Section" &&
+            ((string?)e.Attribute("N") ?? "").StartsWith("Geometry", StringComparison.Ordinal);
+
+        var msecs = mroot.Elements().Where(IsGeom).ToList();
+        if (msecs.Count == 0) return false;
+        foreach (var ms in msecs)
+        {
+            string name = (string?)ms.Attribute("N") ?? "Geometry";
+            var isec = shape.Elements().FirstOrDefault(e => IsGeom(e) && (string?)e.Attribute("N") == name);
+            if (isec == null) return false;
+            int mr = ms.Elements().Count(e => e.Name.LocalName == "Row");
+            int ir = isec.Elements().Count(e => e.Name.LocalName == "Row");
+            if (mr == 0 || ir < mr) return false;
+        }
+        return true;
     }
 
     /// <summary>在母版几何区中查找同 (T, IX) 的行。</summary>

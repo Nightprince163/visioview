@@ -90,6 +90,11 @@ public static class ImageExporter
 
         bool alpha = transparent && format == ExportFormat.Png;
 
+        // 画布（WpfRenderer.Build）自带整页白底，用来在窗口里显示页面。
+        // 导出透明 PNG 时必须把这个白底去掉，否则 host 透明也没用 —— 白底会铺满整张图，
+        // alpha 全是 255，勾了"透明背景"却得到白底图。
+        if (alpha) arranged.Background = null;
+
         // 画布单位是英寸 → 先固定按 96 DIP/英寸转到 DIP，再平移到裁剪区左上角。
         // 真正的放大交给 RenderTargetBitmap 的 dpi 参数：它会把 1 DIP 渲染成 dpi/96 个像素。
         // 这里若再乘一次缩放倍数，就会变成「倍数 × 倍数」（2x 实际渲染成 4x，内容溢出被裁）。

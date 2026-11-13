@@ -16,7 +16,7 @@ TestResults/
 installer/out/
 
 # ── 本机样本与私有数据（不对外发布） ──────────────────────
-/战略经营管理.vsdx
+/*.vsdx
 /testdata
 /tools
 /.workbuddy
