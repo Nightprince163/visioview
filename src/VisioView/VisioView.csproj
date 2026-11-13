@@ -2,6 +2,8 @@
 
   <ItemGroup>
     <ProjectReference Include="..\VisioView.Core\VisioView.Core.csproj" />
+    <!-- 同一个 ico 嵌成 WPF 资源，供窗口标题栏图标使用 -->
+    <Resource Include="../../assets/VisioView.ico" Link="Assets/VisioView.ico" />
   </ItemGroup>
 
   <PropertyGroup>
@@ -19,6 +21,8 @@
     <FileVersion>1.2.0.0</FileVersion>
     <AssemblyVersion>1.2.0.0</AssemblyVersion>
     <RootNamespace>VisioView</RootNamespace>
+    <!-- 写入 exe 的 Win32 图标资源（资源管理器 / 任务栏 / 文件关联显示的就是它） -->
+    <ApplicationIcon>../../assets/VisioView.ico</ApplicationIcon>
   </PropertyGroup>
 
   <!-- 单文件自包含发布配置（dotnet publish 时生效） -->

@@ -1,5 +1,7 @@
 # VisioView
 
+<p align="center"><img src="assets/VisioView-256.png" width="96" alt="VisioView 图标"></p>
+
 一个轻量的 Windows **.vsdx（Visio）查看器**。原生 .NET 10 + WPF，可发布为单文件免安装 EXE，
 打开文件即可查看，不需要安装 Visio。
 
@@ -92,6 +94,9 @@ gh release create v1.0.0 `
 | `src/VisioView.Render.Svg` | SVG 渲染后端（用于比对与调试） |
 | `src/VisioView` | WPF 主程序，画布渲染与交互 |
 | `src/VisioView.Tests` | 命令行回归工具，把每一页导出为 SVG |
+
+图标源文件在 `assets/`（`G 方案：立体折面`）。改完 `make_icon.py` 后跑
+`python assets/make_icon.py`，会重新生成 SVG、多尺寸 `.ico` 和 256px 预览图。
 
 ## 导出图片
 

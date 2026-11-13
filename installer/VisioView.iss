@@ -14,7 +14,7 @@ Compression=lzma2
 SolidCompression=yes
 ArchitecturesInstallIn64BitMode=x64
 PrivilegesRequired=admin
-SetupIconFile=
+SetupIconFile=..\assets\VisioView.ico
 UninstallDisplayIcon={app}\VisioView.exe,0
 
 [Files]
