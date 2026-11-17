@@ -13,7 +13,7 @@
 - **缩放 / 平移 / 适应窗口**
 - **双击打开**：注册 `.vsdx` 文件关联后，资源管理器里双击直接打开
 - **导出图片**：PNG / JPEG，可选「整页画布」或「仅内容区域」，支持 1×–4× 分辨率与透明背景
-- **在线升级**：启动后静默检查 GitHub Releases，发现新版本可一键下载替换并自动重启
+- **在线升级**：启动后静默检查 GitHub / Gitee 双更新源，自动回退到可用源；发现新版本可一键下载替换并自动重启
 - **接近 Visio 的渲染效果**：
   - 形状几何（`MoveTo` / `LineTo` / `RelMoveTo` / `RelLineTo` / `ArcTo` / `EllipticalArcTo` / `Ellipse` / `PolylineTo` / `NURBSTo`）
   - 填充与描边（含 `FillPattern`、`NoFill`、`NoLine`、`NoShow` 语义）
@@ -62,7 +62,8 @@ dotnet publish src/VisioView/VisioView.csproj -c Release -r win-x64 --self-conta
 
 ## 发布新版本
 
-可执行文件**不进仓库**（单文件约 65 MB，入库会让仓库无限膨胀），统一通过 GitHub Releases 分发。
+可执行文件**不进仓库**（单文件约 65 MB，入库会让仓库无限膨胀），通过 **GitHub + Gitee 双源**分发：
+GitHub 是主源，国内访问不畅时更新器自动回退到 Gitee。
 
 1. 本地编译：
 
@@ -73,20 +74,26 @@ dotnet publish src/VisioView/VisioView.csproj -c Release -r win-x64 --self-conta
 2. 打 tag 并推送：
 
    ```bash
-   git tag v1.0.0
-   git push origin v1.0.0
+   git tag v1.4.0
+   git push origin v1.4.0
    ```
 
-3. 在 GitHub 上 **Releases → Draft a new release**，选择刚推的 tag，
-   把 `publish\VisioView.exe` 拖进附件区发布。
+3. 上传 GitHub Release（同名 tag），附件为 `VisioView-1.4.0.exe`。
+   装了 [GitHub CLI](https://cli.github.com/) 的话可以一条命令搞定：
 
-装了 [GitHub CLI](https://cli.github.com/) 的话，第 3 步可以合并成一条命令：
+   ```bash
+   gh release create v1.4.0 `
+     "src/VisioView/bin/Release/net10.0-windows/win-x64/publish/VisioView.exe" `
+     --title "VisioView v1.4.0" --notes "见发布说明"
+   ```
 
-```bash
-gh release create v1.0.0 `
-  "src/VisioView/bin/Release/net10.0-windows/win-x64/publish/VisioView.exe" `
-  --title "VisioView v1.0.0" --notes "首个可下载版本"
-```
+4. 同步到 [Gitee 镜像仓库](https://gitee.com/nightprince_xm/visioview)的 Release：
+   上传**同一份字节**的 exe，外加一份 `SHA256.txt`（Gitee 附件接口不返回 digest，更新器靠它做完整性校验）。
+   免费版限制：单附件 ≤100 MB、单仓库附件总 ≤1 GB，旧版本附件记得删除回收空间。
+
+更新器按顺序尝试 GitHub → Gitee，成功的源会记入 `%LOCALAPPDATA%\VisioView\update-source.txt`，
+下次优先使用；环境变量 `VV_UPDATE_FEED` 可覆盖源列表（多个 URL 用分号分隔）。
+诊断命令 `VisioView.exe --check-update` 会分别打印两个源的连通性、耗时和版本。
 
 ## 项目结构
 

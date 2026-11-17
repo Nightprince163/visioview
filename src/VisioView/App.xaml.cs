@@ -77,22 +77,43 @@ public partial class App : Application
             var log = "update-check.txt";
             try
             {
-                var info = System.Threading.Tasks.Task.Run(() => UpdateChecker.CheckAsync())
+                var probes = System.Threading.Tasks.Task.Run(() => UpdateChecker.CheckAllAsync())
                     .GetAwaiter().GetResult();
+
+                var sb = new System.Text.StringBuilder();
+                sb.AppendLine($"当前版本 {UpdateChecker.CurrentVersion}");
+                sb.AppendLine("更新源探测：");
+                foreach (var p in probes)
+                {
+                    if (p.Info != null)
+                    {
+                        sb.AppendLine($"  [{p.Name}] {p.ElapsedMs} ms  OK  版本 {p.Info.Version}  tag {p.Info.Tag}");
+                        sb.AppendLine($"    API 大小 {p.Info.Size} 字节  校验来源 {p.Info.Sha256Source ?? "无"}");
+                        sb.AppendLine($"    SHA256 {p.Info.Sha256 ?? "(未提供)"}");
+                        sb.AppendLine($"    下载地址 {p.Info.DownloadUrl}");
+                    }
+                    else
+                    {
+                        sb.AppendLine($"  [{p.Name}] {p.ElapsedMs} ms  失败  {p.Error}");
+                        sb.AppendLine($"    地址 {p.Url}");
+                    }
+                }
+
+                UpdateInfo? info = null;
+                foreach (var p in probes)
+                {
+                    if (p.Info != null) { info = p.Info; break; }
+                }
                 if (info == null)
                 {
-                    System.IO.File.WriteAllText(log, "null（更新源内容无法解析）");
+                    sb.AppendLine("全部更新源不可用。");
+                    System.IO.File.WriteAllText(log, sb.ToString());
                     Shutdown(1);
                     return;
                 }
 
-                var sb = new System.Text.StringBuilder();
-                sb.AppendLine($"当前版本 {UpdateChecker.CurrentVersion}");
-                sb.AppendLine($"最新版本 {info.Version}（tag {info.Tag}）");
+                sb.AppendLine($"选用 {info.Source}：最新版本 {info.Version}（tag {info.Tag}）");
                 sb.AppendLine($"有新版本 {UpdateChecker.IsNewer(info.Version)}");
-                sb.AppendLine($"附件 {info.AssetName}  {info.Size} 字节");
-                sb.AppendLine($"SHA256 {info.Sha256 ?? "(未提供)"}");
-                sb.AppendLine($"下载地址 {info.DownloadUrl}");
 
                 if (args.Length >= 2)
                 {
