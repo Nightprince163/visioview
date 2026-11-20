@@ -402,15 +402,26 @@ public static class VsdxParser
             apply(ThemeAccents[ai]);
     }
 
-    private static string? StyleColor(string? styleId, string cellName)
+    /// <summary>
+    /// 从样式链取颜色。默认只认 #RRGGBB——经典调色板索引（如 9/17/18）在老文件里
+    /// 往往是"默认样式"占位值，直接采用会把本来无填充的图形刷成亮绿/亮黄
+    ///（office_plan、db_schema 实测回退）。
+    /// <paramref name="resolvePalette"/> 为 true 时额外解析调色板索引
+    ///（图案填充 FillPattern≥2 的 FillForegnd/FillBkgnd 需要），
+    /// 自定义色查 DocColors，经典色 0-23 委托 <see cref="ColorUtil.Parse"/>（与 GetColor 同源）。
+    /// </summary>
+    private static string? StyleColor(string? styleId, string cellName, bool resolvePalette = false)
     {
         var raw = StyleCellRaw(styleId, cellName);
-        // 只认样式里显式写出的 #RRGGBB。经典调色板索引（如 9/17/18）在老文件里
-        // 往往是"默认样式"占位值，直接采用会把本来无填充的图形刷成亮绿/亮黄
-        //（office_plan、db_schema 实测回退）；真正需要还原的是接线图那种
-        // LineColor='#00bfff' 的显式自定义线色。
-        if (raw == null || raw.TrimStart().Length == 0 || raw.TrimStart()[0] != '#') return null;
-        return ColorUtil.Parse(raw);
+        if (raw == null || raw.TrimStart().Length == 0) return null;
+        if (raw.TrimStart()[0] == '#') return ColorUtil.Parse(raw);
+        if (resolvePalette)
+        {
+            if (int.TryParse(raw, NumberStyles.Integer, CultureInfo.InvariantCulture, out var idx) &&
+                DocColors.TryGetValue(idx, out var custom)) return custom;
+            return ColorUtil.Parse(raw);   // 经典索引 0-23
+        }
+        return null;
     }
 
     /// <summary>把 Character.Font 的 V 值还原成字体名（数字则查字体表）。</summary>
@@ -916,12 +927,7 @@ public static class VsdxParser
         if (charOverrides != null && selfId0 != null) charOverrides.TryGetValue(selfId0, out cSrc0);
         XElement? tabSrc = null;
         if (dimOverrides != null && selfId0 != null) dimOverrides.TryGetValue(selfId0, out tabSrc);
-        // Visio 内置图例母版的副标题条（ID=10）写着占位文字 "Legend Subtitle"；
-        // 实例没有提供副标题时应显示空白。旧实现直接画母版文字，窄条里只露出
-        // 一个字符（看起来像 "3"）。这里在无实例覆盖时抑制该占位文字。
-        bool legendSubtitlePlaceholder = masterId == 35 && selfId == "10" && selfText == null;
-        if (!legendSubtitlePlaceholder)
-            RenderText(effShape, Mh, null, style2, page, selfText, fSrc0, cSrc0, tabSrc);
+        RenderText(effShape, Mh, null, style2, page, selfText, fSrc0, cSrc0, tabSrc);
 
         if (heading && _headingTopScreen.HasValue)
             AlignTop(page, startIdx, _headingTopScreen.Value);
@@ -1385,14 +1391,6 @@ public static class VsdxParser
         shape = ApplyDimensionOverride(shape, dimOverrides, scaleSx, scaleSy);
 
         var style = ReadStyle(shape, inherited, null);
-        // Visio 建筑平面图的 Space 母版根几何是房间底板，继承 Style0 的
-        // FillPattern=1 + FillForegnd=1，显示为浅绿色斜纹。只标记根几何，
-        // 不碰家具/门等子形状。
-        if (masterId == 21 && isRoot)
-        {
-            style.FillTexture = "greenDiagonal";
-            style.FillForegnd ??= "#FFFFFF";
-        }
         // 母版里 THEMEVAL(...) 的填充会随实例配色变化：Visio 把实例算好的颜色缓存
         // 在实例形状的 FillForegnd 里（组织图里是 #339933/#f09609/#1ba1e2/#d80073），
         // 而母版里存的仍是默认主题色 #638bad。这类"随主题"的子形状必须用实例色覆盖；
@@ -1968,7 +1966,7 @@ public static class VsdxParser
             {
                 string gix = (string?)sec.Attribute("IX") ?? "";
                 Console.Error.WriteLine($"  [geom] ID={shape.Attribute("ID")?.Value} sec={secName}/{gix} " +
-                                        $"fill={fill ?? "-"} tex={style.FillTexture ?? "-"} stroke={stroke ?? "-"} noFill={noFill} noLine={noLine} " +
+                                        $"fill={fill ?? "-"} pat={style.FillPattern ?? 1} bg={style.FillBkgnd ?? "-"} stroke={stroke ?? "-"} noFill={noFill} noLine={noLine} " +
                                         $"gw={gw.ToString("0.###", CultureInfo.InvariantCulture)} " +
                                         $"gh={gh.ToString("0.###", CultureInfo.InvariantCulture)}");
             }
@@ -1988,7 +1986,8 @@ public static class VsdxParser
             var path = new PathDrawable
             {
                 Fill = fill,
-                FillTexture = style.FillTexture,
+                FillPatternIndex = style.FillPattern ?? 1,
+                FillBkgnd = fill == null ? null : style.FillBkgnd,
                 GradientStops = hasGradient ? style.GradientStops : null,
                 GradientAngle = style.GradientAngle,
                 Stroke = stroke,
@@ -2972,18 +2971,21 @@ public static class VsdxParser
         var lineStyle = (string?)shape.Attribute("LineStyle");
         var fillStyle = (string?)shape.Attribute("FillStyle");
         var textStyle = (string?)shape.Attribute("TextStyle");
-        var st = new Style
-        {
-            // 形状自身单元格优先；没写时用 LineStyle/FillStyle 指向的文档样式表。
-            FillForegnd = GetColor(shape, "FillForegnd", inh) ?? StyleColor(fillStyle, "FillForegnd"),
-            LineColor = GetColor(shape, "LineColor", inh) ?? StyleColor(lineStyle, "LineColor"),
-            FillPattern = CellInt(shape, "FillPattern") ?? StyleInt(fillStyle, "FillPattern"),
-            LinePattern = CellInt(shape, "LinePattern") ?? StyleInt(lineStyle, "LinePattern"),
-            LineWeight = GetDimNullable(shape, "LineWeight", inh) ?? StyleDim(lineStyle, "LineWeight"),
-            FillTrans = GetDimNullable(shape, "FillForegndTrans", inh) ?? StyleDim(fillStyle, "FillForegndTrans"),
-            LineTrans = GetDimNullable(shape, "LineColorTrans", inh) ?? StyleDim(lineStyle, "LineColorTrans"),
-            GradientAngle = GetDim(shape, "FillGradientAngle", null, Math.PI / 2),
-        };
+        var st = new Style();
+        // FillPattern 先取——图案填充（≥2）时 FillForegnd/FillBkgnd 的调色板索引
+        // 必须解析（Space 母版 FillStyle=34 的 FillForegnd=9 绿 / FillBkgnd=1 白）；
+        // 纯色/无填充则保持旧行为（忽略调色板索引，防默认样式误染色）。
+        int fp = CellInt(shape, "FillPattern") ?? StyleInt(fillStyle, "FillPattern") ?? 1;
+        bool patFill = fp >= 2 && fp <= 24;
+        st.FillForegnd = GetColor(shape, "FillForegnd", inh) ?? StyleColor(fillStyle, "FillForegnd", patFill);
+        st.FillBkgnd = GetColor(shape, "FillBkgnd", inh) ?? StyleColor(fillStyle, "FillBkgnd", patFill);
+        st.LineColor = GetColor(shape, "LineColor", inh) ?? StyleColor(lineStyle, "LineColor");
+        st.FillPattern = CellInt(shape, "FillPattern") ?? StyleInt(fillStyle, "FillPattern");
+        st.LinePattern = CellInt(shape, "LinePattern") ?? StyleInt(lineStyle, "LinePattern");
+        st.LineWeight = GetDimNullable(shape, "LineWeight", inh) ?? StyleDim(lineStyle, "LineWeight");
+        st.FillTrans = GetDimNullable(shape, "FillForegndTrans", inh) ?? StyleDim(fillStyle, "FillForegndTrans");
+        st.LineTrans = GetDimNullable(shape, "LineColorTrans", inh) ?? StyleDim(lineStyle, "LineColorTrans");
+        st.GradientAngle = GetDim(shape, "FillGradientAngle", null, Math.PI / 2);
         // 渐变填充：色标在 FillGradient 段，FillGradientEnabled=1 时启用。
         // 池背景（ms_diagrams）就是这种：FillPattern=0 但 FillGradientEnabled=1。
         if (CellInt(shape, "FillGradientEnabled") == 1)
@@ -3179,8 +3181,12 @@ public static class VsdxParser
             raw = GetColor(inh, name, null);
         }
         if (raw == null) return null;
-        if (int.TryParse(raw, NumberStyles.Integer, CultureInfo.InvariantCulture, out var idx) &&
-            DocColors.TryGetValue(idx, out var custom)) return custom;
+        if (int.TryParse(raw, NumberStyles.Integer, CultureInfo.InvariantCulture, out var idx))
+        {
+            if (DocColors.TryGetValue(idx, out var custom)) return custom;
+            // 经典调色板索引 0-23：仅在显式请求时解析（StyleColor 的 resolvePalette），
+            // 此处不解析——老文件里 V='9' 等常是默认样式占位值，直接采用会误染色。
+        }
         return ColorUtil.Parse(raw);
     }
 

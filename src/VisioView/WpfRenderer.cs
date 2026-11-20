@@ -307,7 +307,7 @@ public static class WpfRenderer
     }
 
     /// <summary>
-    /// 生成路径的填充画刷：渐变 &gt; 纹理 &gt; 纯色。
+    /// 生成路径的填充画刷：渐变 &gt; 图案（FillPattern 2-24）&gt; 纯色。
     /// 渐变用 LinearGradientBrush，StartPoint/EndPoint 按角度投影到单位方块。
     /// ms_diagrams 的池 GradientAngle=π/2（Visio 90°=自下而上），渲染成自上而下的
     /// 浅蓝/橙/红渐变，与 Visio 参考一致。
@@ -338,7 +338,8 @@ public static class WpfRenderer
             return gb;
         }
         if (p.NoFill || p.Fill == null) return null;
-        if (p.FillTexture == "greenDiagonal") return GreenDiagonalBrush(p.FillOpacity);
+        if (p.FillPatternIndex >= 2 && p.FillPatternIndex <= 24)
+            return PatternBrush(p.FillPatternIndex, p.Fill, p.FillBkgnd, p.FillOpacity);
         return WithOpacity(ColorFromHex(p.Fill), p.FillOpacity);
     }
 
@@ -355,27 +356,131 @@ public static class WpfRenderer
         return coll;
     }
 
-    /// <summary>房间底板的绿色斜纹：白底 + 半透明绿色斜线，按 0.08in 平铺。</summary>
-    private static Brush GreenDiagonalBrush(double opacity)
+    /// <summary>
+    /// Visio 内置填充图案（FillPattern 2-24，Fill 对话框顺序）的平铺画刷。
+    /// 每个图案一个正方形 tile：底色 FillBkgnd + 图案线条 FillForegnd。
+    /// 图案语义对照 Visio 填充图案表：2=深色上行斜线、5=深色下行斜线、
+    /// 6=横线、7=竖线、3/23=网格、4/24=菱形、17=棋盘、18=格栅、
+    /// 8-12=点阵、13-16/19-22=宽窄线变体。
+    /// </summary>
+    private static Brush? PatternBrush(int pattern, string fgHex, string? bgHex, double opacity)
     {
-        const double s = 0.05;
-        var group = new DrawingGroup();
-        group.Children.Add(new GeometryDrawing(
-            Brushes.White, null,
-            new RectangleGeometry(new Rect(0, 0, s, s))));
-        double w = s * 0.18;
-        var geo = new StreamGeometry();
-        using (var ctx = geo.Open())
+        // (tile 英寸, 线条宽英寸) —— 密度参考 Visio 图案的视觉比例
+        var (s, w) = pattern switch
         {
-            // 一条贯穿整块 tile 的斜带，平铺后形成连续的“\”斜纹。
-            ctx.BeginFigure(new Point(0, 0), true, true);
-            ctx.LineTo(new Point(w, 0), true, false);
-            ctx.LineTo(new Point(s, s), true, false);
-            ctx.LineTo(new Point(s - w, s), true, false);
+            2 or 5 => (0.05, 0.009),      // 深色对角斜线（2 上行 "/"，5 下行 "\"）
+            3 => (0.12, 0.008),           // 大网格
+            4 => (0.12, 0.008),           // 大菱形描边
+            6 => (0.05, 0.009),           // 深色横线
+            7 => (0.05, 0.009),           // 深色竖线
+            13 => (0.12, 0.012),          // 宽横线
+            14 => (0.12, 0.012),          // 宽竖线
+            15 or 16 => (0.05, 0.006),    // 浅对角斜线
+            17 => (0.06, 0),              // 棋盘
+            18 => (0.08, 0.005),          // 格栅（细双斜线）
+            19 => (0.035, 0.007),         // 密横线
+            20 => (0.035, 0.007),         // 密竖线
+            21 or 22 => (0.035, 0.007),   // 密斜线
+            23 => (0.05, 0.007),          // 小网格
+            24 => (0.05, 0.007),          // 小菱形描边
+            _ => (0.05, 0.008),           // 8-12 点阵等
+        };
+        var fg = ColorFromHex(fgHex);
+        var group = new DrawingGroup();
+        if (bgHex != null)
+            group.Children.Add(new GeometryDrawing(
+                new SolidColorBrush(ColorFromHex(bgHex)), null,
+                new RectangleGeometry(new Rect(0, 0, s, s))));
+
+        void AddLines(Geometry geo) =>
+            group.Children.Add(new GeometryDrawing(new SolidColorBrush(fg), null, geo));
+
+        switch (pattern)
+        {
+            case 2:  // 上行斜线 "/"：贯穿 tile 的斜带
+            case 5:  // 下行斜线 "\"：镜像
+            case 15: case 16: case 21: case 22:
+            {
+                var geo = new StreamGeometry();
+                using (var ctx = geo.Open())
+                {
+                    bool up = pattern is 2 or 16 or 22;
+                    if (up)
+                    {
+                        ctx.BeginFigure(new Point(0, 0), true, true);
+                        ctx.LineTo(new Point(w, 0), true, false);
+                        ctx.LineTo(new Point(s, s), true, false);
+                        ctx.LineTo(new Point(s - w, s), true, false);
+                    }
+                    else
+                    {
+                        ctx.BeginFigure(new Point(0, s), true, true);
+                        ctx.LineTo(new Point(w, s), true, false);
+                        ctx.LineTo(new Point(s, 0), true, false);
+                        ctx.LineTo(new Point(s - w, 0), true, false);
+                    }
+                }
+                geo.Freeze();
+                AddLines(geo);
+                break;
+            }
+            case 6: case 7: case 13: case 14: case 19: case 20:   // 横线 / 竖线
+            {
+                bool horiz = pattern is 6 or 13 or 19;
+                var r = horiz ? new Rect(0, s / 2 - w / 2, s, w) : new Rect(s / 2 - w / 2, 0, w, s);
+                AddLines(new RectangleGeometry(r));
+                break;
+            }
+            case 3: case 23:   // 网格：横 + 竖
+            {
+                AddLines(new RectangleGeometry(new Rect(0, s / 2 - w / 2, s, w)));
+                AddLines(new RectangleGeometry(new Rect(s / 2 - w / 2, 0, w, s)));
+                break;
+            }
+            case 4: case 24:   // 菱形描边：tile 内旋转 45° 的方框（stroke，非填充）
+            {
+                var geo = new StreamGeometry();
+                using (var ctx = geo.Open())
+                {
+                    ctx.BeginFigure(new Point(s / 2, 0), false, true);
+                    ctx.LineTo(new Point(s, s / 2), true, false);
+                    ctx.LineTo(new Point(s / 2, s), true, false);
+                    ctx.LineTo(new Point(0, s / 2), true, false);
+                }
+                geo.Freeze();
+                var pen = new Pen(new SolidColorBrush(fg), w);
+                group.Children.Add(new GeometryDrawing(null, pen, geo));
+                break;
+            }
+            case 17:   // 棋盘：两个交错实心块
+            {
+                double h = s / 2;
+                group.Children.Add(new GeometryDrawing(new SolidColorBrush(fg), null,
+                    new RectangleGeometry(new Rect(0, 0, h, h))));
+                group.Children.Add(new GeometryDrawing(new SolidColorBrush(fg), null,
+                    new RectangleGeometry(new Rect(h, h, h, h))));
+                break;
+            }
+            case 18:   // 格栅：两条对角细线 "×"
+            {
+                var g1 = new LineGeometry(new Point(0, 0), new Point(s, s));
+                var g2 = new LineGeometry(new Point(0, s), new Point(s, 0));
+                var pen = new Pen(new SolidColorBrush(fg), w);
+                group.Children.Add(new GeometryDrawing(null, pen, g1));
+                group.Children.Add(new GeometryDrawing(null, pen, g2));
+                break;
+            }
+            default:   // 8-12 点阵：中心圆点，密度随编号变化
+            {
+                double r = pattern switch
+                {
+                    8 => 0.006, 9 => 0.008, 10 => 0.010, 11 => 0.008, 12 => 0.005,
+                    _ => 0.007,
+                };
+                AddLines(new EllipseGeometry(new Point(s / 2, s / 2), r, r));
+                break;
+            }
         }
-        geo.Freeze();
-        group.Children.Add(new GeometryDrawing(
-            new SolidColorBrush(Color.FromRgb(0xA9, 0xD1, 0x8E)), null, geo));
         group.Freeze();
         var brush = new DrawingBrush(group)
         {

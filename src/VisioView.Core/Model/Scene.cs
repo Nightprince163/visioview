@@ -44,10 +44,15 @@ public class PathDrawable : Drawable
 {
     /// <summary>已变换到页面坐标（Y 已翻转）的可渲染指令。</summary>
     public List<ILowCmd> Commands { get; } = new();
-    /// <summary>填充颜色 #RRGGBB，为 null 表示无填充。</summary>
+    /// <summary>填充颜色 #RRGGBB（纯色或图案的线条色），为 null 表示无填充。</summary>
     public string? Fill { get; set; }
-    /// <summary>内置填充纹理（greenDiagonal = 房间底板绿色斜纹）。</summary>
-    public string? FillTexture { get; set; }
+    /// <summary>
+    /// Visio FillPattern 图案索引（1=纯色，2-24=内置图案，见 Style.FillPattern 注释）。
+    /// ≥2 时按图案平铺渲染：线条色=Fill，底色=FillBkgnd。
+    /// </summary>
+    public int FillPatternIndex { get; set; } = 1;
+    /// <summary>图案填充的背景色 #RRGGBB；null 表示透明底。</summary>
+    public string? FillBkgnd { get; set; }
     /// <summary>线性渐变色标；非 null 时优先于纯色 Fill。来自 Visio FillGradient 段。</summary>
     public IReadOnlyList<GradientStopDef>? GradientStops { get; set; }
     /// <summary>渐变方向角（弧度，屏幕坐标 Y 向下）；ms_diagrams 池为 π/2 即上下渐变。</summary>

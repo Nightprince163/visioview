@@ -17,14 +17,20 @@ public static class SvgRenderer
         sb.AppendLine($"<svg xmlns=\"http://www.w3.org/2000/svg\" width=\"{w:0.0}\" height=\"{h:0.0}\" viewBox=\"0 0 {page.Width:0.#####} {page.Height:0.#####}\">");
         sb.AppendLine($"  <rect x=\"0\" y=\"0\" width=\"{page.Width:0.#####}\" height=\"{page.Height:0.#####}\" fill=\"#ffffff\"/>");
 
-        // 渐变定义放在 defs 里，路径用 url(#gradN) 引用。
+        // defs：渐变定义 + 图案填充定义，路径用 url(#gradN)/url(#patN) 引用。
         var grads = page.Drawables.OfType<PathDrawable>()
             .Where(p => p.GradientStops is { Count: >= 2 }).ToList();
-        if (grads.Count > 0)
+        var pats = page.Drawables.OfType<PathDrawable>()
+            .Where(p => p.GradientStops is not { Count: >= 2 }
+                        && p.FillPatternIndex >= 2 && p.FillPatternIndex <= 24
+                        && !p.NoFill && p.Fill != null).ToList();
+        if (grads.Count > 0 || pats.Count > 0)
         {
             sb.AppendLine("  <defs>");
             for (int gi = 0; gi < grads.Count; gi++)
                 sb.AppendLine(GradientDef(grads[gi], gi));
+            for (int pi = 0; pi < pats.Count; pi++)
+                sb.AppendLine(PatternDef(pats[pi], pi));
             sb.AppendLine("  </defs>");
         }
 
@@ -33,7 +39,9 @@ public static class SvgRenderer
             if (d is PathDrawable p)
             {
                 int gi = grads.IndexOf(p);
-                sb.AppendLine(RenderPath(p, gi >= 0 ? $"url(#grad{gi})" : null));
+                int pi = pats.IndexOf(p);
+                string? fo2 = gi >= 0 ? $"url(#grad{gi})" : pi >= 0 ? $"url(#pat{pi})" : null;
+                sb.AppendLine(RenderPath(p, fo2));
             }
             else if (d is TextDrawable t)
                 sb.AppendLine(RenderText(t));
@@ -66,6 +74,109 @@ public static class SvgRenderer
             sb.Append($"<stop offset=\"{Math.Clamp(s.Position, 0, 1):0.#####}\" stop-color=\"{s.Color}\"{op}/>");
         }
         sb.Append("</linearGradient>");
+        return sb.ToString();
+    }
+
+    /// <summary>
+    /// Visio 内置填充图案（FillPattern 2-24）的 SVG pattern 定义。
+    /// tile 尺寸/线宽与 WpfRenderer.PatternBrush 表一致，坐标单位为英寸。
+    /// </summary>
+    private static string PatternDef(PathDrawable p, int index)
+    {
+        int pattern = p.FillPatternIndex;
+        // (tile 英寸, 线条宽英寸) —— 与 WpfRenderer.PatternBrush 同表
+        var (s, w) = pattern switch
+        {
+            2 or 5 => (0.05, 0.009),
+            3 => (0.12, 0.008),
+            4 => (0.12, 0.008),
+            6 => (0.05, 0.009),
+            7 => (0.05, 0.009),
+            13 => (0.12, 0.012),
+            14 => (0.12, 0.012),
+            15 or 16 => (0.05, 0.006),
+            17 => (0.06, 0),
+            18 => (0.08, 0.005),
+            19 => (0.035, 0.007),
+            20 => (0.035, 0.007),
+            21 or 22 => (0.035, 0.007),
+            23 => (0.05, 0.007),
+            24 => (0.05, 0.007),
+            _ => (0.05, 0.008),
+        };
+        string fg = p.Fill!;
+        string? bg = p.FillBkgnd;
+        double opacity = Math.Clamp(p.FillOpacity, 0, 1);
+
+        var sb = new StringBuilder();
+        sb.Append($"    <pattern id=\"pat{index}\" patternUnits=\"userSpaceOnUse\" " +
+                  $"width=\"{s:0.#####}\" height=\"{s:0.#####}\">");
+        bool wrapOp = opacity < 0.999;
+        if (wrapOp) sb.Append($"<g opacity=\"{opacity:0.###}\">");
+
+        // 底色
+        if (bg != null)
+            sb.Append($"<rect x=\"0\" y=\"0\" width=\"{s:0.#####}\" height=\"{s:0.#####}\" fill=\"{bg}\"/>");
+
+        switch (pattern)
+        {
+            case 2: case 5: case 15: case 16: case 21: case 22:
+            {
+                bool up = pattern is 2 or 16 or 22;
+                if (up)
+                    sb.Append($"<polygon points=\"0,0 {w:0.#####},0 {s:0.#####},{s:0.#####} {s - w:0.#####},{s:0.#####}\" fill=\"{fg}\"/>");
+                else
+                    sb.Append($"<polygon points=\"0,{s:0.#####} {w:0.#####},{s:0.#####} {s:0.#####},0 {s - w:0.#####},0\" fill=\"{fg}\"/>");
+                break;
+            }
+            case 6: case 7: case 13: case 14: case 19: case 20:
+            {
+                bool horiz = pattern is 6 or 13 or 19;
+                if (horiz)
+                    sb.Append($"<rect x=\"0\" y=\"{s / 2 - w / 2:0.#####}\" width=\"{s:0.#####}\" height=\"{w:0.#####}\" fill=\"{fg}\"/>");
+                else
+                    sb.Append($"<rect x=\"{s / 2 - w / 2:0.#####}\" y=\"0\" width=\"{w:0.#####}\" height=\"{s:0.#####}\" fill=\"{fg}\"/>");
+                break;
+            }
+            case 3: case 23:
+            {
+                sb.Append($"<rect x=\"0\" y=\"{s / 2 - w / 2:0.#####}\" width=\"{s:0.#####}\" height=\"{w:0.#####}\" fill=\"{fg}\"/>");
+                sb.Append($"<rect x=\"{s / 2 - w / 2:0.#####}\" y=\"0\" width=\"{w:0.#####}\" height=\"{s:0.#####}\" fill=\"{fg}\"/>");
+                break;
+            }
+            case 4: case 24:   // 菱形描边
+            {
+                sb.Append($"<polygon points=\"{s / 2:0.#####},0 {s:0.#####},{s / 2:0.#####} {s / 2:0.#####},{s:0.#####} 0,{s / 2:0.#####}\" " +
+                          $"fill=\"none\" stroke=\"{fg}\" stroke-width=\"{w:0.#####}\"/>");
+                break;
+            }
+            case 17:   // 棋盘
+            {
+                double h = s / 2;
+                sb.Append($"<rect x=\"0\" y=\"0\" width=\"{h:0.#####}\" height=\"{h:0.#####}\" fill=\"{fg}\"/>");
+                sb.Append($"<rect x=\"{h:0.#####}\" y=\"{h:0.#####}\" width=\"{h:0.#####}\" height=\"{h:0.#####}\" fill=\"{fg}\"/>");
+                break;
+            }
+            case 18:   // 格栅 "×"
+            {
+                sb.Append($"<line x1=\"0\" y1=\"0\" x2=\"{s:0.#####}\" y2=\"{s:0.#####}\" stroke=\"{fg}\" stroke-width=\"{w:0.#####}\"/>");
+                sb.Append($"<line x1=\"0\" y1=\"{s:0.#####}\" x2=\"{s:0.#####}\" y2=\"0\" stroke=\"{fg}\" stroke-width=\"{w:0.#####}\"/>");
+                break;
+            }
+            default:   // 8-12 点阵
+            {
+                double r = pattern switch
+                {
+                    8 => 0.006, 9 => 0.008, 10 => 0.010, 11 => 0.008, 12 => 0.005,
+                    _ => 0.007,
+                };
+                sb.Append($"<circle cx=\"{s / 2:0.#####}\" cy=\"{s / 2:0.#####}\" r=\"{r:0.#####}\" fill=\"{fg}\"/>");
+                break;
+            }
+        }
+
+        if (wrapOp) sb.Append("</g>");
+        sb.Append("</pattern>");
         return sb.ToString();
     }
 
