@@ -403,25 +403,19 @@ public static class VsdxParser
     }
 
     /// <summary>
-    /// 从样式链取颜色。默认只认 #RRGGBB——经典调色板索引（如 9/17/18）在老文件里
-    /// 往往是"默认样式"占位值，直接采用会把本来无填充的图形刷成亮绿/亮黄
-    ///（office_plan、db_schema 实测回退）。
-    /// <paramref name="resolvePalette"/> 为 true 时额外解析调色板索引
-    ///（图案填充 FillPattern≥2 的 FillForegnd/FillBkgnd 需要），
-    /// 自定义色查 DocColors，经典色 0-23 委托 <see cref="ColorUtil.Parse"/>（与 GetColor 同源）。
+    /// 从样式链取颜色。支持 #RRGGBB 字面量和调色板索引
+    ///（自定义色查 DocColors，经典色 0-23 委托 <see cref="ColorUtil.Parse"/>，与 GetColor 同源）。
+    /// 调色板索引必须解析——wiring_schematic 等文件的颜色全在线条/填充样式里
+    /// （如 LineColor=2 红、5 黄、1 白线），忽略索引会把所有彩色线画成黑色。
     /// </summary>
-    private static string? StyleColor(string? styleId, string cellName, bool resolvePalette = false)
+    private static string? StyleColor(string? styleId, string cellName)
     {
         var raw = StyleCellRaw(styleId, cellName);
         if (raw == null || raw.TrimStart().Length == 0) return null;
         if (raw.TrimStart()[0] == '#') return ColorUtil.Parse(raw);
-        if (resolvePalette)
-        {
-            if (int.TryParse(raw, NumberStyles.Integer, CultureInfo.InvariantCulture, out var idx) &&
-                DocColors.TryGetValue(idx, out var custom)) return custom;
-            return ColorUtil.Parse(raw);   // 经典索引 0-23
-        }
-        return null;
+        if (int.TryParse(raw, NumberStyles.Integer, CultureInfo.InvariantCulture, out var idx) &&
+            DocColors.TryGetValue(idx, out var custom)) return custom;
+        return ColorUtil.Parse(raw);
     }
 
     /// <summary>把 Character.Font 的 V 值还原成字体名（数字则查字体表）。</summary>
@@ -1236,6 +1230,15 @@ public static class VsdxParser
         double len = Math.Sqrt(dx * dx + dy * dy);
         if (len < 1e-6) return true;
 
+        // 形状自身 Geometry 有显式 LineTo/MoveTo 时，路径已经由作者定义（可能是直线、
+        // 折线或任意形状），不能套直角路由。只有 Geometry 为空/退化的动态连接线才
+        // 需要按"直角"走线自动生成折线。
+        if (HasExplicitConnectorGeometry(shape))
+        {
+            RenderConnectorGeometry(shape, parentM, style, page, bx.Value, by.Value);
+            return true;
+        }
+
         // ---- 走线：Visio 的动态连接线默认是"直角"路由，不是对角线 ----
         // 两端点如果 XY 都不重合，就按正交折线走：先从起点沿它所在的边（上下 / 左右）离开，
         // 再折向终点的方向。判断"上下边还是左右边"靠连接点在目标形状包围盒上的位置。
@@ -1332,6 +1335,158 @@ public static class VsdxParser
             page.Drawables.Add(td);
         }
         return true;
+    }
+
+    /// <summary>形状 Geometry 是否有显式 LineTo/MoveTo 等路径行（非空几何）。</summary>
+    private static bool HasExplicitConnectorGeometry(XElement shape)
+    {
+        foreach (var sec in shape.Elements().Where(e => e.Name.LocalName == "Section"))
+        {
+            if ((string?)sec.Attribute("N") is not ("Geometry" or "Geometry1" or "Geometry2")) continue;
+            foreach (var row in sec.Elements().Where(e => e.Name.LocalName == "Row"))
+            {
+                var t = (string?)row.Attribute("T");
+                if (t is "MoveTo" or "LineTo" or "ArcTo" or "EllipticalArcTo" or "CubicBezierTo" or "NURBSTo" or "SplineStart" or "SplineKnot")
+                    return true;
+            }
+        }
+        return false;
+    }
+
+    /// <summary>
+    /// 按形状自身 Geometry 行渲染连接线路径（1-D 形状：本地原点=Begin，Width/Height=End-Begin）。
+    /// 与通用几何渲染一致，支持 LineTo/ArcTo/NURBSTo 等。
+    /// </summary>
+    private static void RenderConnectorGeometry(
+        XElement shape, Affine parentM, Style style, PageScene page,
+        double beginX, double beginY)
+    {
+        string color = style.LineColor ?? "#000000";
+        double lw = style.LineWeight.HasValue && style.LineWeight.Value > 0 ? style.LineWeight.Value : 0.0139;
+        bool noLine = style.LinePattern == 0;
+
+        var path = new PathDrawable
+        {
+            Fill = null,
+            Stroke = noLine ? null : color,
+            StrokeWidth = lw,
+            NoFill = true,
+            NoLine = noLine,
+        };
+
+        // 1-D 形状路径起点 = Begin（本地原点）。Geometry 若没有显式 MoveTo，
+        // 也要先 MoveTo(Begin)，否则 LineTo 缺少起始点、渲染器跳过整个路径。
+        bool hasMove = false;
+        foreach (var sec in shape.Elements().Where(e => e.Name.LocalName == "Section"))
+        {
+            if ((string?)sec.Attribute("N") is not ("Geometry" or "Geometry1" or "Geometry2")) continue;
+            foreach (var row in sec.Elements().Where(e => e.Name.LocalName == "Row"))
+            {
+                var t = (string?)row.Attribute("T");
+                double X(string n) => CellVal(row, n) is { } s && double.TryParse(s, NF, CultureInfo.InvariantCulture, out var d) ? d : 0;
+
+                switch (t)
+                {
+                    case "MoveTo":
+                    {
+                        var p = parentM.Apply(beginX + X("X"), beginY + X("Y"));
+                        path.Commands.Add(new _Move(p.X, page.Height - p.Y));
+                        path.Include(p.X, page.Height - p.Y);
+                        hasMove = true;
+                        break;
+                    }
+                    case "LineTo":
+                    {
+                        if (!hasMove)
+                        {
+                            var pB = parentM.Apply(beginX, beginY);
+                            path.Commands.Add(new _Move(pB.X, page.Height - pB.Y));
+                            path.Include(pB.X, page.Height - pB.Y);
+                            hasMove = true;
+                        }
+                        var p = parentM.Apply(beginX + X("X"), beginY + X("Y"));
+                        path.Commands.Add(new _Line(p.X, page.Height - p.Y));
+                        path.Include(p.X, page.Height - p.Y);
+                        break;
+                    }
+                }
+            }
+        }
+
+        if (path.Commands.Count > 0)
+        {
+            if (Trace)
+                Console.Error.WriteLine($"  [conn-geom] ID={shape.Attribute("ID")?.Value} cmds={path.Commands.Count} color={color} noLine={noLine}");
+            page.Drawables.Add(path);
+        }
+
+        // 箭头
+        int arrow = (int)Math.Round(GetDim(shape, "EndArrow", null, 0));
+        if (arrow != 0 && path.Commands.Count >= 2)
+        {
+            _Line? lastLine = null;
+            _Move? lastMove = null;
+            foreach (var cmd in path.Commands)
+            {
+                if (cmd is _Move m) lastMove = m;
+                else if (cmd is _Line l) lastLine = l;
+            }
+            if (lastLine != null && lastMove != null)
+            {
+                double adx = lastLine.X - lastMove.X, ady = lastLine.Y - lastMove.Y;
+                double alen = Math.Sqrt(adx * adx + ady * ady);
+                if (alen > 1e-9)
+                {
+                    double ux = adx / alen, uy = ady / alen;
+                    double ah = Math.Max(0.10, lw * 9);
+                    double aw = ah * 0.45;
+                    double bxx = lastLine.X - ux * ah, byy = lastLine.Y - uy * ah;
+                    double nx = -uy, ny = ux;
+                    var tri = new PathDrawable { Fill = color, Stroke = color, StrokeWidth = lw * 0.4, NoFill = false };
+                    tri.Commands.Add(new _Move(lastLine.X, lastLine.Y));
+                    tri.Commands.Add(new _Line(bxx + nx * aw, byy + ny * aw));
+                    tri.Commands.Add(new _Line(bxx - nx * aw, byy - ny * aw));
+                    tri.Commands.Add(new _Close());
+                    tri.Include(lastLine.X, lastLine.Y);
+                    tri.Include(bxx + nx * aw, byy + ny * aw);
+                    tri.Include(bxx - nx * aw, byy - ny * aw);
+                    page.Drawables.Add(tri);
+                }
+            }
+        }
+
+        // 连接线文字
+        var textEl = shape.Elements().FirstOrDefault(e => e.Name.LocalName == "Text");
+        if (textEl != null && !string.IsNullOrWhiteSpace(textEl.Value))
+        {
+            string txt = textEl.Value.Trim();
+            double fs = style.CharSize.HasValue ? style.CharSize.Value : 0.1667;
+            double mx = 0, my = 0;
+            var coords = new List<(double X, double Y)>();
+            foreach (var cmd in path.Commands)
+            {
+                if (cmd is _Move mv) coords.Add((mv.X, mv.Y));
+                else if (cmd is _Line ln) coords.Add((ln.X, ln.Y));
+            }
+            if (coords.Count >= 2)
+            {
+                mx = (coords[^1].X + coords[^2].X) / 2;
+                my = (coords[^1].Y + coords[^2].Y) / 2 - fs * 0.9;
+            }
+            var td = new TextDrawable
+            {
+                Text = txt,
+                Color = style.TextColor ?? "#000000",
+                FontSize = fs,
+                CenterX = mx,
+                CenterY = my,
+            };
+            double ew, eh;
+            EstimateTextSize(txt, fs, null, out ew, out eh);
+            td.Include(mx - ew / 2, my - eh / 2);
+            td.Include(mx + ew / 2, my + eh / 2);
+            page.Drawables.Add(td);
+        }
     }
 
     /// <summary>
@@ -2008,6 +2163,14 @@ public static class VsdxParser
                 path.Include(X, Y);
             }
 
+            // 只投影、不计入包围盒：贝塞尔/弧的控制点不在曲线上，Include 会把
+            // 包围盒撑到形状外（如 EllipticalArcTo 还原的二次控制点在梭形上下边界之外）。
+            void ProjectScreen(double x, double y, out double X, out double Y)
+            {
+                var p = M.Apply(x, y);
+                X = p.X; Y = page.Height - p.Y;
+            }
+
             double curX = 0, curY = 0;
             foreach (var row in sec.Elements().Where(e => e.Name.LocalName == "Row"))
             {
@@ -2067,16 +2230,25 @@ public static class VsdxParser
                     }
                     case "EllipticalArcTo":
                     {
-                        // Visio 语义：A / B 是弧的「控制点」坐标（两端切线的交点），不是半径。
-                        // 旧实现把 A 当半径，半弦长=半径就会画成半径等于弦长一半的半圆"穹顶"。
-                        // 改用二次贝塞尔 Q(控制点, 终点)：端点与切线方向都和 Visio 一致。
+                        // Visio/ECMA-376 官方语义：A/B 是「弧上的一个点」（通常在弧中点附近），
+                        // 不是贝塞尔控制点、也不是切线交点或半径；C 是长轴角度，D 是长短轴比。
+                        // 旧实现直接把 A/B 当二次贝塞尔控制点，但 Q 曲线并不经过控制点：
+                        //   Q(0.5) = (P0 + 2C + P1)/4  —— 弧顶只到 A/B 相对弦中点偏移的一半。
+                        // 于是 Visio 内置 Ellipse 母版（两段对称椭圆弧拼成的梭形）被压成扁片：
+                        // rdf_sample 的 Alice/BOB 参考宽高比 ~3.4，旧版渲染 ~7。
+                        // 正确做法：让二次贝塞尔「经过」A/B 这个弧中点 M，控制点取 M 关于弦中点的对称点：
+                        //   Q(0.5) = M  =>  C = 2M - (P0+P1)/2
+                        // 这对两段对称弧都能精确还原顶点（上弧顶=M、下弧底=M），梭形恢复饱满。
                         double ex = RowDim(row, "X", shape, curX, mrow, inh);
                         double ey = RowDim(row, "Y", shape, curY, mrow, inh);
-                        double cx = RowDim(row, "A", shape, curX, mrow, inh);
-                        double cy = RowDim(row, "B", shape, curY, mrow, inh);
-                        ToScreen(cx, cy, out var qx, out var qy);
-                        ToScreen(ex, ey, out var ax, out var ay);
-                        path.Commands.Add(new _Quad(qx, qy, ax, ay));
+                        double midX = RowDim(row, "A", shape, curX, mrow, inh);
+                        double midY = RowDim(row, "B", shape, curY, mrow, inh);
+                        double ctrlX = 2 * midX - (curX + ex) / 2;
+                        double ctrlY = 2 * midY - (curY + ey) / 2;
+                        ProjectScreen(ctrlX, ctrlY, out var qx, out var qy);
+                        ToScreen(midX, midY, out _, out _); // 弧中点在曲线上，计入包围盒；控制点不计
+                        ToScreen(ex, ey, out var endSx, out var endSy);
+                        path.Commands.Add(new _Quad(qx, qy, endSx, endSy));
                         curX = ex; curY = ey;
                         break;
                     }
@@ -2245,8 +2417,8 @@ public static class VsdxParser
         var frame = inh ?? shape;
         double frameW = GetDim(frame, "Width", null, 0);
         double frameH = GetDim(frame, "Height", null, 0);
-        double ownW = GetDim(shape, "Width", null, 0);
-        double ownH = GetDim(shape, "Height", null, 0);
+        double ownW = GetDim(shape, "Width", inh, 0);
+        double ownH = GetDim(shape, "Height", inh, 0);
         double tx = ResolveTextPin(shape, frame, "TxtPinX", frameW, ownW, frameW / 2);
         double ty = ResolveTextPin(shape, frame, "TxtPinY", frameH, ownH, frameH / 2);
         var c = ownM.Apply(tx, ty);
@@ -2285,8 +2457,8 @@ public static class VsdxParser
         if (tw <= 0.15) tw = frameW > 0.15 ? frameW : ownW;
         if (tw > 0.15) td.MaxWidth = tw * Math.Max(scaleX, 1e-6) * 1.2;
 
-        td.HorizontalAlignment = ParagraphInt(shape, "HorzAlign") ?? 1;
-        td.VerticalAlignment = CellInt(shape, "VerticalAlign") ?? 1;
+        td.HorizontalAlignment = ParagraphInt(shape, "HorzAlign") ?? (inh != null ? ParagraphInt(inh, "HorzAlign") : null) ?? 1;
+        td.VerticalAlignment = CellInt(shape, "VerticalAlign") ?? (inh != null ? CellInt(inh, "VerticalAlign") : null) ?? 1;
         var tabStops = ReadTabStops(tabSource ?? shape);
         td.TabStops = tabStops;
         // 保留制表符，由渲染器按 TabStops 分栏定位。旧实现折算成空格，
@@ -2295,15 +2467,20 @@ public static class VsdxParser
         // 文字框（页面坐标）：缺省 TxtPin 在框中心，所以框四角是 pin ± TxtWidth/2、pin ± TxtHeight/2。
         // 左/上对齐时按这个框定位，而不是把整块文字围绕 TxtPin 居中。
         double th = GetDim(shape, "TxtHeight", inh, 0);
-        if (th <= 0.15) th = frameH > 0.15 ? frameH : ownH;
+        // TxtHeight 极小（≈0）时视为缺失，回退到形状高度；正常单行文本高度（0.13in≈9.6pt）不能吞。
+        if (th < 0.01) th = frameH > 0.01 ? frameH : ownH;
         // 非表格的矮文本框（标题/标签）回到基线版的垂直居中，避免标题被顶到框外；
         // db_schema 的区域标签框很高，仍保持 Visio 的顶部对齐。
         if (tabStops == null && th < 0.8 && td.VerticalAlignment == 0)
             td.VerticalAlignment = 1;
-        if (Math.Abs(rotDeg) < 0.05 && tw > 0.15 && th > 0.15)
+        if (Math.Abs(rotDeg) < 0.05 && tw > 0.15 && th > 0.01)
         {
-            var topLeft = ownM.Apply(tx - tw / 2, ty + th / 2);
-            var botRight = ownM.Apply(tx + tw / 2, ty - th / 2);
+            // Visio 的 TxtPin 是文字锚点：va=0 锚在文字顶部、va=1 在中间、va=2 在底部。
+            // 文本框必须按锚点位置偏移——否则 va=2 时框居中于锚点，文字会向下溢出到
+            // 白色名字条区域（orgchart 的 "President & CEO" 被白条盖住）。
+            double anchorShift = td.VerticalAlignment switch { 0 => -th / 2, 2 => th / 2, _ => 0 };
+            var topLeft = ownM.Apply(tx - tw / 2, ty + th / 2 + anchorShift);
+            var botRight = ownM.Apply(tx + tw / 2, ty - th / 2 + anchorShift);
             double ml = Math.Max(0, GetDim(shape, "LeftMargin", inh, 0));
             double mr = Math.Max(0, GetDim(shape, "RightMargin", inh, 0));
             double mt = Math.Max(0, GetDim(shape, "TopMargin", inh, 0));
@@ -2315,6 +2492,14 @@ public static class VsdxParser
         }
 
         td.Include(sx, sy);
+        // 文字锚点 → 文字中心：va=0 文字在锚点下方、va=2 在上方，包围盒/非框渲染用调整后的中心。
+        double anchorDy = td.VerticalAlignment switch { 0 => th / 2, 2 => -th / 2, _ => 0 };
+        if (Math.Abs(anchorDy) > 1e-9 && Math.Abs(rotDeg) < 0.05)
+        {
+            var shifted = ownM.Apply(tx, ty + anchorDy);
+            sx = shifted.X; sy = page.Height - shifted.Y;
+            td.CenterX = sx; td.CenterY = sy;
+        }
         if (Trace)
             Console.Error.WriteLine($"  [text] ID={shape.Attribute("ID")?.Value} ov={textOverride != null} " +
                                     $"c=({sx:0.##},{sy:0.##}) fs={td.FontSize:0.####} color={td.Color} " +
@@ -2972,13 +3157,8 @@ public static class VsdxParser
         var fillStyle = (string?)shape.Attribute("FillStyle");
         var textStyle = (string?)shape.Attribute("TextStyle");
         var st = new Style();
-        // FillPattern 先取——图案填充（≥2）时 FillForegnd/FillBkgnd 的调色板索引
-        // 必须解析（Space 母版 FillStyle=34 的 FillForegnd=9 绿 / FillBkgnd=1 白）；
-        // 纯色/无填充则保持旧行为（忽略调色板索引，防默认样式误染色）。
-        int fp = CellInt(shape, "FillPattern") ?? StyleInt(fillStyle, "FillPattern") ?? 1;
-        bool patFill = fp >= 2 && fp <= 24;
-        st.FillForegnd = GetColor(shape, "FillForegnd", inh) ?? StyleColor(fillStyle, "FillForegnd", patFill);
-        st.FillBkgnd = GetColor(shape, "FillBkgnd", inh) ?? StyleColor(fillStyle, "FillBkgnd", patFill);
+        st.FillForegnd = GetColor(shape, "FillForegnd", inh) ?? StyleColor(fillStyle, "FillForegnd");
+        st.FillBkgnd = GetColor(shape, "FillBkgnd", inh) ?? StyleColor(fillStyle, "FillBkgnd");
         st.LineColor = GetColor(shape, "LineColor", inh) ?? StyleColor(lineStyle, "LineColor");
         st.FillPattern = CellInt(shape, "FillPattern") ?? StyleInt(fillStyle, "FillPattern");
         st.LinePattern = CellInt(shape, "LinePattern") ?? StyleInt(lineStyle, "LinePattern");

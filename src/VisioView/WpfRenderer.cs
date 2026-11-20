@@ -249,7 +249,9 @@ public static class WpfRenderer
             double ty = t.VerticalAlignment switch
             {
                 0 => 0,
-                2 => Math.Max(0, bh - tb.DesiredSize.Height),
+                // 底部对齐：允许负值让文字向上溢出（WPF 行高可能大于 TxtHeight），
+                // 保证文字底边贴框底；clamp 到 0 会让文字向下溢出到白条/下层元素。
+                2 => bh - tb.DesiredSize.Height,
                 _ => Math.Max(0, (bh - tb.DesiredSize.Height) / 2),
             };
             Canvas.SetLeft(tb, tx);
