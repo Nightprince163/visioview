@@ -38,15 +38,15 @@ public readonly struct Affine
     /// </summary>
     public static Affine MakePlacement(
         double pinX, double pinY, double locPinX, double locPinY,
-        double angle, double sx, double sy)
+        double angle, double sx, double sy, double flipX = 1, double flipY = 1)
     {
         double cos = Math.Cos(angle), sin = Math.Sin(angle);
-        double a = cos * sx;
-        double c = -sin * sy;
-        double e = pinX - cos * locPinX + sin * locPinY;
-        double b = sin * sx;
-        double d = cos * sy;
-        double f = pinY - sin * locPinX - cos * locPinY;
+        double a = cos * sx * flipX;
+        double b = sin * sx * flipX;
+        double c = -sin * sy * flipY;
+        double d = cos * sy * flipY;
+        double e = pinX - cos * flipX * locPinX + sin * flipY * locPinY;
+        double f = pinY - sin * flipX * locPinX - cos * flipY * locPinY;
         return new Affine(a, b, c, d, e, f);
     }
 }

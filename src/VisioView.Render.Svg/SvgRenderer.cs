@@ -17,10 +17,24 @@ public static class SvgRenderer
         sb.AppendLine($"<svg xmlns=\"http://www.w3.org/2000/svg\" width=\"{w:0.0}\" height=\"{h:0.0}\" viewBox=\"0 0 {page.Width:0.#####} {page.Height:0.#####}\">");
         sb.AppendLine($"  <rect x=\"0\" y=\"0\" width=\"{page.Width:0.#####}\" height=\"{page.Height:0.#####}\" fill=\"#ffffff\"/>");
 
+        // 渐变定义放在 defs 里，路径用 url(#gradN) 引用。
+        var grads = page.Drawables.OfType<PathDrawable>()
+            .Where(p => p.GradientStops is { Count: >= 2 }).ToList();
+        if (grads.Count > 0)
+        {
+            sb.AppendLine("  <defs>");
+            for (int gi = 0; gi < grads.Count; gi++)
+                sb.AppendLine(GradientDef(grads[gi], gi));
+            sb.AppendLine("  </defs>");
+        }
+
         foreach (var d in page.Drawables)
         {
             if (d is PathDrawable p)
-                sb.AppendLine(RenderPath(p));
+            {
+                int gi = grads.IndexOf(p);
+                sb.AppendLine(RenderPath(p, gi >= 0 ? $"url(#grad{gi})" : null));
+            }
             else if (d is TextDrawable t)
                 sb.AppendLine(RenderText(t));
             else if (d is ImageDrawable im)
@@ -34,7 +48,28 @@ public static class SvgRenderer
     public static string RenderScene(Scene scene)
         => string.Join("\n", scene.Pages.Select(RenderPage));
 
-    private static string RenderPath(PathDrawable p)
+    /// <summary>生成 SVG linearGradient 定义。渐变方向与 WpfRenderer 一致。</summary>
+    private static string GradientDef(PathDrawable p, int index)
+    {
+        double ang = p.GradientAngle;
+        double dx = Math.Cos(ang), dy = Math.Sin(ang);
+        double ax = Math.Abs(dx), ay = Math.Abs(dy);
+        double scale = ax > 1e-9 ? 1.0 / (2 * ax) : 1.0 / (2 * ay);
+        double x1 = 0.5 - dx * scale, y1 = 0.5 + dy * scale;
+        double x2 = 0.5 + dx * scale, y2 = 0.5 - dy * scale;
+        var sb = new StringBuilder();
+        sb.Append($"    <linearGradient id=\"grad{index}\" gradientUnits=\"objectBoundingBox\" " +
+                  $"x1=\"{x1:0.#####}\" y1=\"{y1:0.#####}\" x2=\"{x2:0.#####}\" y2=\"{y2:0.#####}\">");
+        foreach (var s in p.GradientStops!)
+        {
+            string op = p.FillOpacity >= 0.999 ? "" : $" stop-opacity=\"{p.FillOpacity:0.###}\"";
+            sb.Append($"<stop offset=\"{Math.Clamp(s.Position, 0, 1):0.#####}\" stop-color=\"{s.Color}\"{op}/>");
+        }
+        sb.Append("</linearGradient>");
+        return sb.ToString();
+    }
+
+    private static string RenderPath(PathDrawable p, string? fillOverride = null)
     {
         if (p.Commands.Count == 0) return "";
         var d = new StringBuilder();
@@ -61,12 +96,14 @@ public static class SvgRenderer
                 case _Close: d.Append("Z "); break;
             }
         }
-        string fill = (p.NoFill || p.Fill == null) ? "none" : p.Fill;
+        string fill = fillOverride ?? ((p.NoFill || p.Fill == null) ? "none" : p.Fill);
         string stroke = (p.NoLine || p.Stroke == null) ? "none" : p.Stroke;
         // viewBox/路径坐标都以「英寸」为用户单位，故 stroke-width 也应直接用英寸，
         // 若再乘 PX_PER_IN 会放大 96 倍，导致粗达 1 英寸、整张图被描边糊成一片黑。
         string sw = p.StrokeWidth.ToString("0.####", CultureInfo.InvariantCulture);
-        return $"  <path d=\"{d.ToString().Trim()}\" fill=\"{fill}\" stroke=\"{stroke}\" stroke-width=\"{sw}\"/>";
+        string fo = p.FillOpacity >= 0.999 ? "" : $" fill-opacity=\"{p.FillOpacity:0.###}\"";
+        string so = p.StrokeOpacity >= 0.999 ? "" : $" stroke-opacity=\"{p.StrokeOpacity:0.###}\"";
+        return $"  <path d=\"{d.ToString().Trim()}\" fill=\"{fill}\" stroke=\"{stroke}\" stroke-width=\"{sw}\"{fo}{so}/>";
     }
 
     private static string RenderImage(ImageDrawable im)

@@ -5,12 +5,15 @@ namespace VisioView.Core;
 /// <summary>把 Visio 的颜色表达式解析为 #RRGGBB；无法识别时返回 null。</summary>
 public static class ColorUtil
 {
-    // Visio 经典 24 色调色板（按颜色索引 0-23）。
+    // Visio 默认调色板（MS-VSDX 2.2.7.6 Color Table，索引 0-23）。
+    // 注意：这不是 Windows 的 VGA 16 色顺序！旧实现用错顺序，导致索引 17 的
+    // 外墙被画成 #CC99FF 淡紫，而规范/Visio 实际是 #B3B3B3 灰（实测参考图 (179,179,179)）。
+    // 索引 >= 24 由 document.xml 的 <Colors><ColorEntry IX RGB> 定义。
     private static readonly string[] Palette =
     {
-        "#000000", "#800000", "#008000", "#808000", "#000080", "#800080", "#008080", "#808080",
-        "#FF0000", "#00FF00", "#FFFF00", "#0000FF", "#FF00FF", "#00FFFF", "#C0C0C0", "#FFFFFF",
-        "#990066", "#CC99FF", "#CCFFCC", "#FFFF99", "#99CCFF", "#FF99CC", "#99FF99", "#FFCC99"
+        "#000000", "#FFFFFF", "#FF0000", "#00FF00", "#0000FF", "#FFFF00", "#FF00FF", "#00FFFF",
+        "#800000", "#008000", "#000080", "#808000", "#800080", "#008080", "#C0C0C0", "#E6E6E6",
+        "#CDCDCD", "#B3B3B3", "#9A9A9A", "#808080", "#666666", "#4D4D4D", "#333333", "#1A1A1A"
     };
 
     public static string? Parse(string? expr)

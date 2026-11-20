@@ -1,5 +1,14 @@
 namespace VisioView.Core.Model;
 
+/// <summary>渐变的单个色标：Position 0..1，Color 为 #RRGGBB。</summary>
+public sealed class GradientStopDef
+{
+    public double Position { get; set; }
+    public string Color { get; set; } = "#FFFFFF";
+    public GradientStopDef(double position, string color) { Position = position; Color = color; }
+    public GradientStopDef() { }
+}
+
 /// <summary>整份文档解析后的场景（页面列表）。</summary>
 public class Scene
 {
@@ -37,11 +46,30 @@ public class PathDrawable : Drawable
     public List<ILowCmd> Commands { get; } = new();
     /// <summary>填充颜色 #RRGGBB，为 null 表示无填充。</summary>
     public string? Fill { get; set; }
+    /// <summary>内置填充纹理（greenDiagonal = 房间底板绿色斜纹）。</summary>
+    public string? FillTexture { get; set; }
+    /// <summary>线性渐变色标；非 null 时优先于纯色 Fill。来自 Visio FillGradient 段。</summary>
+    public IReadOnlyList<GradientStopDef>? GradientStops { get; set; }
+    /// <summary>渐变方向角（弧度，屏幕坐标 Y 向下）；ms_diagrams 池为 π/2 即上下渐变。</summary>
+    public double GradientAngle { get; set; }
     /// <summary>描边颜色 #RRGGBB，为 null 表示无描边。</summary>
     public string? Stroke { get; set; }
     public double StrokeWidth { get; set; } = 1;
     public bool NoFill { get; set; }
     public bool NoLine { get; set; }
+    /// <summary>填充不透明度 0..1（1=完全不透明）。来自 Visio 的 FillForegndTrans。</summary>
+    public double FillOpacity { get; set; } = 1;
+    /// <summary>描边不透明度 0..1（1=完全不透明）。来自 Visio 的 LineColorTrans。</summary>
+    public double StrokeOpacity { get; set; } = 1;
+}
+
+public sealed class TextLineStyle
+{
+    public double FontSize { get; set; } = 0.1667;
+    public string? Color { get; set; }
+    public string? FontFamily { get; set; }
+    public bool Bold { get; set; }
+    public bool Italic { get; set; }
 }
 
 public class TextDrawable : Drawable
@@ -54,6 +82,19 @@ public class TextDrawable : Drawable
     public double CenterY { get; set; }
     /// <summary>可用文本框宽度（英寸，对应 TxtWidth）。为 null 表示不换行。</summary>
     public double? MaxWidth { get; set; }
+    /// <summary>水平对齐：0=左，1=中，2=右（Visio Paragraph.HorzAlign）。</summary>
+    public int HorizontalAlignment { get; set; } = 1;
+    /// <summary>垂直对齐：0=上，1=中，2=下（Visio VerticalAlign）。</summary>
+    public int VerticalAlignment { get; set; } = 1;
+    /// <summary>文字框在页面坐标中的位置/尺寸（含内边距）。非居中对齐时用它定位。</summary>
+    public double? BoxLeft { get; set; }
+    public double? BoxTop { get; set; }
+    public double? BoxWidth { get; set; }
+    public double? BoxHeight { get; set; }
+    /// <summary>Visio Tabs 段的制表位（页面英寸，相对文字框左边缘）。</summary>
+    public IReadOnlyList<double>? TabStops { get; set; }
+    /// <summary>每段文字的 Character run 样式；数量与文本行数一致时才生效。</summary>
+    public IReadOnlyList<TextLineStyle>? LineStyles { get; set; }
     /// <summary>加粗（Character.Style bit0）。</summary>
     public bool Bold { get; set; }
     /// <summary>斜体（Character.Style bit1）。</summary>
