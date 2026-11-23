@@ -4,7 +4,7 @@
 
 [Setup]
 AppName=VisioView
-AppVersion=1.5.2
+AppVersion=1.5.3
 AppPublisher=VisioView
 DefaultDirName={autopf}\VisioView
 DefaultGroupName=VisioView

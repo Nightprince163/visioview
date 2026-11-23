@@ -343,6 +343,34 @@ public static class VsdxParser
         return double.TryParse(v, NF, CultureInfo.InvariantCulture, out var d) ? d : null;
     }
 
+    /// <summary>
+    /// 解析连接线箭头类型。Visio 的箭头写在形状/母版单元格里，也常由线条样式链给出
+    /// （Connector 样式写的是 "Themed"，意为用主题的线端装饰，默认主题即实心三角）。
+    /// 旧实现只读形状单元格的 EndArrow，导致样式链定义的箭头全部丢失——circuit/rdf 的
+    /// 连线因此都没有箭头。这里按「形状 → 母版 → 样式链」的顺序取值，"Themed" 归一到
+    /// Visio 默认主题箭头（实心三角，索引 13，与 OfficeIMO.Visio 的默认一致）。
+    /// </summary>
+    private static int? ResolveArrow(XElement shape, XElement? inh, string cellName, int themedDefault)
+    {
+        var raw = CellRaw(shape, cellName) ?? (inh != null ? CellRaw(inh, cellName) : null);
+        if (raw == null)
+        {
+            var ls = (string?)shape.Attribute("LineStyle")
+                     ?? (inh != null ? (string?)inh.Attribute("LineStyle") : null);
+            raw = StyleCellRaw(ls, cellName);
+        }
+        if (raw == null) return null;
+        if (raw.Trim().Equals("Themed", StringComparison.OrdinalIgnoreCase)) return themedDefault;
+        return int.TryParse(raw, NumberStyles.Integer, CultureInfo.InvariantCulture, out var n) ? n : null;
+    }
+
+    /// <summary>箭头大小等级 0..6 → 相对长度倍率。OfficeIMO.Visio 的 Alto~Colossal 映射。</summary>
+    private static double ArrowScale(int? level)
+    {
+        var i = Math.Clamp(level ?? 2, 0, 6);
+        return new[] { 0.6, 0.8, 1.0, 1.3, 1.7, 2.3, 3.0 }[i];
+    }
+
     /// <summary>从文档样式表取单元格值，样式自身继承时沿 LineStyle/FillStyle 链回溯。</summary>
     private static string? StyleCellRaw(string? styleId, string cellName, int depth = 0)
     {
@@ -609,7 +637,8 @@ public static class VsdxParser
         IReadOnlyDictionary<string, XElement>? geomOverrides = null,
         double scaleSx = 1, double scaleSy = 1,
         IReadOnlyDictionary<string, XElement>? charOverrides = null,
-        IReadOnlyDictionary<string, XElement>? dimOverrides = null)
+        IReadOnlyDictionary<string, XElement>? dimOverrides = null,
+        IReadOnlyDictionary<string, XElement>? lineWeightOverrides = null)
     {
         // ---- 嵌入图片（Foreign 形状，如组织图里的照片）----
         if ((string?)shape.Attribute("Type") == "Foreign")
@@ -644,6 +673,7 @@ public static class VsdxParser
             var kidFields = BuildFieldOverrides(shape);
             var kidChars = BuildCharOverrides(shape);
             var kidDims = BuildDimensionOverrides(shape);
+            var kidLw = BuildLineWeightOverrides(shape);
             // 动态连接线（1-D 形状）：看到 Begin/End 就直接连两端点，别用母版里的 "⊔" 占位几何。
             // 但 1-D 形状也可能自带真实几何（弧形墙的实例子形状带完整弧线），
             // 那种情况画成直线会把弧线丢掉，必须继续走几何渲染。
@@ -777,7 +807,8 @@ public static class VsdxParser
                     RenderMasterContent(child, M, masters, page, instStyle, mid, kidText,
                         isRoot: child == mrootEl, instanceStyle: instStyle, imageOverrides: kidImages,
                         fieldOverrides: kidFields, geomOverrides: kidGeom, scaleSx: sx, scaleSy: sy,
-                        charOverrides: kidChars, dimOverrides: kidDims);
+                        charOverrides: kidChars, dimOverrides: kidDims, lineWeightOverrides: kidLw,
+                        stateOverrides: shape);
             }
             _headingTopScreen = prevTop;
 
@@ -785,6 +816,9 @@ public static class VsdxParser
             // 容器/泳道的标题文字也放在"未纵向拉伸"的坐标系里，才会落在标题条中间，
             // 否则会被拉伸后的 TxtPinY 顶到条外。
             var MText = HasHeadingChild(mdef) ? new Affine(M.A, M.B, M.C, Math.Sign(M.D), M.E, M.F) : M;
+            // 实例自身的 <Text> 取代母版根的默认文字（aspose 脑图节点：实例 "Placement" vs
+            // 母版占位 "New Topic"），位置用实例的文本框锚点，所以文字在这里画；
+            // RenderMasterContent 那边对母版根文字跳过，两处不会重叠。
             RenderText(shape, MText, mroot, instStyle, page);
             return;
         }
@@ -865,6 +899,19 @@ public static class VsdxParser
         }
 
         var style2 = ReadStyle(shape, inherited, null);
+        // 实例子形状显式缓存的线宽覆盖母版旧值（电路图放大器/电阻的粗线）。
+        // 这里覆盖的是「母版子形状经 RenderShape 递归」的路径；RenderMasterContent
+        // 里已有同名逻辑覆盖另一条路径。两者都按 MasterShape ID 精确匹配。
+        var lwKey = (string?)shape.Attribute("ID");
+        if (lineWeightOverrides != null && lwKey != null &&
+            lineWeightOverrides.TryGetValue(lwKey, out var lwSrc2))
+        {
+            var lwCell2 = lwSrc2.Elements().FirstOrDefault(e =>
+                e.Name.LocalName == "Cell" && (string?)e.Attribute("N") == "LineWeight");
+            if (lwCell2 != null && double.TryParse((string?)lwCell2.Attribute("V"), NF,
+                                                   CultureInfo.InvariantCulture, out var lw2) && lw2 > 0)
+                style2 = style2.WithLineWeight(lw2);
+        }
         // 纯页面形状（无 Master/MasterShape）的 "Themed" 填充/线条色：
         // 按 QuickStyleFillColor 索引解析为主题 accent1（rdf_sample 的 subject 蓝底、
         // 连接线蓝色）。只在此路径处理，不影响母版子形状（network_topology 设备图标）。
@@ -1170,38 +1217,13 @@ public static class VsdxParser
                     }
                     page.Drawables.Add(curve);
 
-                    int arrow = (int)Math.Round(GetDim(shape, "EndArrow", inh, 0));
-                    if (arrow != 0)
-                    {
-                        // 箭头方向取曲线末端切线（p2 → 终点），拐弯后才不会指歪
-                        double adx = e.X - p2.X, ady = e.Y - p2.Y;
-                        double alen = Math.Sqrt(adx * adx + ady * ady);
-                        if (alen < 1e-9)
-                        {
-                            adx = e.X - s.X; ady = e.Y - s.Y;
-                            alen = Math.Sqrt(adx * adx + ady * ady);
-                        }
-                        if (alen > 1e-9)
-                        {
-                            double ux = adx / alen, uy = ady / alen;
-                            double ah = Math.Max(0.10, lw * 9);
-                            double aw = ah * 0.45;
-                            double bxx = e.X - ux * ah, byy = e.Y - uy * ah;
-                            double nx = -uy, ny = ux;
-                            var tri = new PathDrawable
-                            {
-                                Fill = color, Stroke = color, StrokeWidth = lw * 0.4, NoFill = false,
-                            };
-                            tri.Commands.Add(new _Move(e.X, e.Y));
-                            tri.Commands.Add(new _Line(bxx + nx * aw, byy + ny * aw));
-                            tri.Commands.Add(new _Line(bxx - nx * aw, byy - ny * aw));
-                            tri.Commands.Add(new _Close());
-                            tri.Include(e.X, e.Y);
-                            tri.Include(bxx + nx * aw, byy + ny * aw);
-                            tri.Include(bxx - nx * aw, byy - ny * aw);
-                            page.Drawables.Add(tri);
-                        }
-                    }
+                    // 箭头方向取曲线末端切线（p2 → 终点），拐弯后才不会指歪
+                    double adx = e.X - p2.X, ady = e.Y - p2.Y;
+                    if (Math.Sqrt(adx * adx + ady * ady) < 1e-9) { adx = e.X - s.X; ady = e.Y - s.Y; }
+                    AddConnectorArrow(page, color, lw, e.X, e.Y, e.X - adx, e.Y - ady,
+                        style.EndArrow ?? 0, style.EndArrowSize);
+                    AddConnectorArrow(page, color, lw, s.X, s.Y, e.X, e.Y,
+                        style.BeginArrow ?? 0, style.BeginArrowSize);
                 }
                 return true;   // 已按曲线连接线处理
             }
@@ -1235,7 +1257,7 @@ public static class VsdxParser
         // 需要按"直角"走线自动生成折线。
         if (HasExplicitConnectorGeometry(shape))
         {
-            RenderConnectorGeometry(shape, parentM, style, page, bx.Value, by.Value);
+            RenderConnectorGeometry(shape, parentM, style, page, bx.Value, by.Value, ex.Value, ey.Value);
             return true;
         }
 
@@ -1287,30 +1309,15 @@ public static class VsdxParser
             foreach (var q in pts) line.Include(q.X, q.Y);
             page.Drawables.Add(line);
 
-            int arrow = (int)Math.Round(GetDim(shape, "EndArrow", inh, 0));
-            if (arrow != 0)
-            {
-                // 箭头方向取最后一段，拐弯后才不会指歪
-                var last = pts[pts.Count - 1];
-                var prev = pts[pts.Count - 2];
-                double adx = last.X - prev.X, ady = last.Y - prev.Y;
-                double alen = Math.Sqrt(adx * adx + ady * ady);
-                if (alen < 1e-9) { adx = dx; ady = dy; alen = len; }
-                double ux = adx / alen, uy = ady / alen;
-                double ah = Math.Max(0.10, lw * 9);   // 箭头长度
-                double aw = ah * 0.45;                // 箭头半宽
-                double bxx = x2 - ux * ah, byy = y2 - uy * ah;
-                double nx = -uy, ny = ux;
-                var tri = new PathDrawable { Fill = color, Stroke = color, StrokeWidth = lw * 0.4, NoFill = false };
-                tri.Commands.Add(new _Move(x2, y2));
-                tri.Commands.Add(new _Line(bxx + nx * aw, byy + ny * aw));
-                tri.Commands.Add(new _Line(bxx - nx * aw, byy - ny * aw));
-                tri.Commands.Add(new _Close());
-                tri.Include(x2, y2);
-                tri.Include(bxx + nx * aw, byy + ny * aw);
-                tri.Include(bxx - nx * aw, byy - ny * aw);
-                page.Drawables.Add(tri);
-            }
+            // 箭头方向取最后一段，拐弯后才不会指歪
+            var last = pts[pts.Count - 1];
+            var prev = pts[pts.Count - 2];
+            double adx = last.X - prev.X, ady = last.Y - prev.Y;
+            if (Math.Sqrt(adx * adx + ady * ady) < 1e-9) { adx = dx; ady = dy; }
+            AddConnectorArrow(page, color, lw, x2, y2, x2 - adx, y2 - ady,
+                style.EndArrow ?? 0, style.EndArrowSize);
+            AddConnectorArrow(page, color, lw, x1, y1, x2, y2,
+                style.BeginArrow ?? 0, style.BeginArrowSize);
         }
 
         // 连接线上的文字（少见）：放在线段中点上方
@@ -1345,6 +1352,9 @@ public static class VsdxParser
             if ((string?)sec.Attribute("N") is not ("Geometry" or "Geometry1" or "Geometry2")) continue;
             foreach (var row in sec.Elements().Where(e => e.Name.LocalName == "Row"))
             {
+                // Visio 用 Del='1' 标记已删除的历史几何行，必须忽略：
+                // 否则一个只剩删除行的段会被误判为有几何（且渲染时会多画线段）。
+                if ((string?)row.Attribute("Del") == "1") continue;
                 var t = (string?)row.Attribute("T");
                 if (t is "MoveTo" or "LineTo" or "ArcTo" or "EllipticalArcTo" or "CubicBezierTo" or "NURBSTo" or "SplineStart" or "SplineKnot")
                     return true;
@@ -1354,12 +1364,54 @@ public static class VsdxParser
     }
 
     /// <summary>
+    /// 在连线终点（或起点）补箭头。方向取最后一段的方向向量，形状按 Visio 索引映射：
+    /// 0=无；1=简单开口箭头；4/5/13=实心三角；其余不认识的按三角（OfficeIMO 的通用降级）。
+    /// 大小按 BeginArrowSize/EndArrowSize 的 0..6 等级缩放，长度基准取线宽，另设最小可见长度。
+    /// </summary>
+    private static void AddConnectorArrow(
+        PageScene page, string color, double lw,
+        double tipX, double tipY, double fromX, double fromY,
+        int kind, int? sizeLevel)
+    {
+        if (kind == 0) return;
+        double adx = tipX - fromX, ady = tipY - fromY;
+        double alen = Math.Sqrt(adx * adx + ady * ady);
+        if (alen < 1e-9) return;
+        double ux = adx / alen, uy = ady / alen;
+
+        double scale = ArrowScale(sizeLevel);
+        double ah = Math.Max(0.09, lw * 4) * scale;   // 箭头长度
+        double aw = ah * 0.45;                         // 半宽
+        double bxx = tipX - ux * ah, byy = tipY - uy * ah;
+        double nx = -uy, ny = ux;
+
+        bool triangle = kind != 1;   // 1=简单开口箭头，其余按实心三角
+        var a = new PathDrawable
+        {
+            Fill = triangle ? color : null,
+            Stroke = color,
+            StrokeWidth = triangle ? Math.Max(0.006, lw * 0.35) : Math.Max(0.01, lw * 0.8),
+            NoFill = !triangle,
+            NoLine = false,
+        };
+        a.Commands.Add(new _Move(tipX, tipY));
+        a.Commands.Add(new _Line(bxx + nx * aw, byy + ny * aw));
+        if (!triangle) a.Commands.Add(new _Move(tipX, tipY)); // 开口箭头：两笔从尖端出发
+        a.Commands.Add(new _Line(bxx - nx * aw, byy - ny * aw));
+        if (triangle) a.Commands.Add(new _Close());
+        a.Include(tipX, tipY);
+        a.Include(bxx + nx * aw, byy + ny * aw);
+        a.Include(bxx - nx * aw, byy - ny * aw);
+        page.Drawables.Add(a);
+    }
+
+    /// <summary>
     /// 按形状自身 Geometry 行渲染连接线路径（1-D 形状：本地原点=Begin，Width/Height=End-Begin）。
     /// 与通用几何渲染一致，支持 LineTo/ArcTo/NURBSTo 等。
     /// </summary>
     private static void RenderConnectorGeometry(
         XElement shape, Affine parentM, Style style, PageScene page,
-        double beginX, double beginY)
+        double beginX, double beginY, double endX, double endY)
     {
         string color = style.LineColor ?? "#000000";
         double lw = style.LineWeight.HasValue && style.LineWeight.Value > 0 ? style.LineWeight.Value : 0.0139;
@@ -1374,43 +1426,59 @@ public static class VsdxParser
             NoLine = noLine,
         };
 
-        // 1-D 形状路径起点 = Begin（本地原点）。Geometry 若没有显式 MoveTo，
-        // 也要先 MoveTo(Begin)，否则 LineTo 缺少起始点、渲染器跳过整个路径。
-        bool hasMove = false;
+        // 收集有效路径行（跳过 Del='1' 墓碑行）。
+        var rows = new List<(string T, XElement Row)>();
         foreach (var sec in shape.Elements().Where(e => e.Name.LocalName == "Section"))
         {
             if ((string?)sec.Attribute("N") is not ("Geometry" or "Geometry1" or "Geometry2")) continue;
             foreach (var row in sec.Elements().Where(e => e.Name.LocalName == "Row"))
             {
+                if ((string?)row.Attribute("Del") == "1") continue;
                 var t = (string?)row.Attribute("T");
-                double X(string n) => CellVal(row, n) is { } s && double.TryParse(s, NF, CultureInfo.InvariantCulture, out var d) ? d : 0;
-
-                switch (t)
-                {
-                    case "MoveTo":
-                    {
-                        var p = parentM.Apply(beginX + X("X"), beginY + X("Y"));
-                        path.Commands.Add(new _Move(p.X, page.Height - p.Y));
-                        path.Include(p.X, page.Height - p.Y);
-                        hasMove = true;
-                        break;
-                    }
-                    case "LineTo":
-                    {
-                        if (!hasMove)
-                        {
-                            var pB = parentM.Apply(beginX, beginY);
-                            path.Commands.Add(new _Move(pB.X, page.Height - pB.Y));
-                            path.Include(pB.X, page.Height - pB.Y);
-                            hasMove = true;
-                        }
-                        var p = parentM.Apply(beginX + X("X"), beginY + X("Y"));
-                        path.Commands.Add(new _Line(p.X, page.Height - p.Y));
-                        path.Include(p.X, page.Height - p.Y);
-                        break;
-                    }
-                }
+                if (t is "MoveTo" or "LineTo") rows.Add((t, row));
             }
+        }
+
+        // 把几何行还原成「相对 Begin 的本地折线」。
+        // 关键：LineTo 缺失的 X/Y 表示沿用上一点的对应坐标（Visio 语义），不能当 0。
+        // 若当 0，末行（常只写一个坐标）会多画一条回到 Begin 的线，整条直角折线
+        // 看起来就成了一条对角线——big_process / 3_v2 的连线被拉直即此原因。
+        var local = new List<(double X, double Y)>();
+        bool TryNum(XElement row, string n, out double v)
+        {
+            v = 0;
+            var s = CellVal(row, n);
+            return s != null && double.TryParse(s, NF, CultureInfo.InvariantCulture, out v);
+        }
+        if (rows.Count > 0 && rows[0].T == "LineTo") local.Add((0, 0)); // 隐式起笔点 = Begin
+        double curX = 0, curY = 0;
+        foreach (var (_, row) in rows)
+        {
+            if (TryNum(row, "X", out var rx)) curX = rx;
+            if (TryNum(row, "Y", out var ry)) curY = ry;
+            if (local.Count == 0 || Math.Abs(local[^1].X - curX) > 1e-6 || Math.Abs(local[^1].Y - curY) > 1e-6)
+                local.Add((curX, curY));
+        }
+
+        // 端点校验：折线最后一点必须落在 End（相对 Begin = End-Begin 附近）。
+        // 对不上说明这段几何只是母版残留/带偏移的占位坐标，退回直线更可靠。
+        bool matchesEnd = local.Count >= 2 &&
+            Math.Abs(local[^1].X - (endX - beginX)) < 0.02 &&
+            Math.Abs(local[^1].Y - (endY - beginY)) < 0.02;
+        if (!matchesEnd)
+        {
+            local.Clear();
+            local.Add((0, 0));
+            local.Add((endX - beginX, endY - beginY));
+        }
+
+        foreach (var (lx, ly) in local)
+        {
+            var p = parentM.Apply(beginX + lx, beginY + ly);
+            double px = p.X, py = page.Height - p.Y;
+            if (path.Commands.Count == 0) path.Commands.Add(new _Move(px, py));
+            else path.Commands.Add(new _Line(px, py));
+            path.Include(px, py);
         }
 
         if (path.Commands.Count > 0)
@@ -1420,39 +1488,21 @@ public static class VsdxParser
             page.Drawables.Add(path);
         }
 
-        // 箭头
-        int arrow = (int)Math.Round(GetDim(shape, "EndArrow", null, 0));
-        if (arrow != 0 && path.Commands.Count >= 2)
+        // 箭头：方向取路径最后一段（末端）/第一段（起点）的方向向量
+        var coords = new List<(double X, double Y)>();
+        foreach (var cmd in path.Commands)
         {
-            _Line? lastLine = null;
-            _Move? lastMove = null;
-            foreach (var cmd in path.Commands)
-            {
-                if (cmd is _Move m) lastMove = m;
-                else if (cmd is _Line l) lastLine = l;
-            }
-            if (lastLine != null && lastMove != null)
-            {
-                double adx = lastLine.X - lastMove.X, ady = lastLine.Y - lastMove.Y;
-                double alen = Math.Sqrt(adx * adx + ady * ady);
-                if (alen > 1e-9)
-                {
-                    double ux = adx / alen, uy = ady / alen;
-                    double ah = Math.Max(0.10, lw * 9);
-                    double aw = ah * 0.45;
-                    double bxx = lastLine.X - ux * ah, byy = lastLine.Y - uy * ah;
-                    double nx = -uy, ny = ux;
-                    var tri = new PathDrawable { Fill = color, Stroke = color, StrokeWidth = lw * 0.4, NoFill = false };
-                    tri.Commands.Add(new _Move(lastLine.X, lastLine.Y));
-                    tri.Commands.Add(new _Line(bxx + nx * aw, byy + ny * aw));
-                    tri.Commands.Add(new _Line(bxx - nx * aw, byy - ny * aw));
-                    tri.Commands.Add(new _Close());
-                    tri.Include(lastLine.X, lastLine.Y);
-                    tri.Include(bxx + nx * aw, byy + ny * aw);
-                    tri.Include(bxx - nx * aw, byy - ny * aw);
-                    page.Drawables.Add(tri);
-                }
-            }
+            if (cmd is _Move mv) coords.Add((mv.X, mv.Y));
+            else if (cmd is _Line ln) coords.Add((ln.X, ln.Y));
+        }
+        if (coords.Count >= 2)
+        {
+            var tipE = coords[^1]; var fromE = coords[^2];
+            AddConnectorArrow(page, color, lw, tipE.X, tipE.Y, fromE.X, fromE.Y,
+                style.EndArrow ?? 0, style.EndArrowSize);
+            var tipB = coords[0]; var fromB = coords[1];
+            AddConnectorArrow(page, color, lw, tipB.X, tipB.Y, fromB.X, fromB.Y,
+                style.BeginArrow ?? 0, style.BeginArrowSize);
         }
 
         // 连接线文字
@@ -1462,12 +1512,6 @@ public static class VsdxParser
             string txt = textEl.Value.Trim();
             double fs = style.CharSize.HasValue ? style.CharSize.Value : 0.1667;
             double mx = 0, my = 0;
-            var coords = new List<(double X, double Y)>();
-            foreach (var cmd in path.Commands)
-            {
-                if (cmd is _Move mv) coords.Add((mv.X, mv.Y));
-                else if (cmd is _Line ln) coords.Add((ln.X, ln.Y));
-            }
             if (coords.Count >= 2)
             {
                 mx = (coords[^1].X + coords[^2].X) / 2;
@@ -1532,9 +1576,10 @@ public static class VsdxParser
         IReadOnlyDictionary<string, XElement>? geomOverrides = null,
         double scaleSx = 1, double scaleSy = 1,
         IReadOnlyDictionary<string, XElement>? charOverrides = null,
-        IReadOnlyDictionary<string, XElement>? dimOverrides = null)
+        IReadOnlyDictionary<string, XElement>? dimOverrides = null,
+        IReadOnlyDictionary<string, XElement>? lineWeightOverrides = null,
+        XElement? stateOverrides = null)
     {
-        // 母版里的 Foreign 形状也要出图（组织图照片占位就定义在母版 ID=14）。
         if ((string?)shape.Attribute("Type") == "Foreign")
         {
             RenderMasterImage(shape, M, page, masterId, masters, imageOverrides);
@@ -1546,6 +1591,19 @@ public static class VsdxParser
         shape = ApplyDimensionOverride(shape, dimOverrides, scaleSx, scaleSy);
 
         var style = ReadStyle(shape, inherited, null);
+        // 用户在实例子形状上改过的线宽会被 Visio 缓存进实例（母版仍是旧值）。
+        // 按 MasterShape 精确匹配套用，只有实例显式写了 LineWeight 才生效——
+        // 避免全局继承实例线宽破坏 timeline / 2_v2 等文档。
+        var selfIdLw = (string?)shape.Attribute("ID");
+        if (lineWeightOverrides != null && selfIdLw != null &&
+            lineWeightOverrides.TryGetValue(selfIdLw, out var lwSrc))
+        {
+            var lwCell = lwSrc.Elements().FirstOrDefault(e =>
+                e.Name.LocalName == "Cell" && (string?)e.Attribute("N") == "LineWeight");
+            if (lwCell != null && double.TryParse((string?)lwCell.Attribute("V"), NF,
+                                                  CultureInfo.InvariantCulture, out var lwVal) && lwVal > 0)
+                style = style.WithLineWeight(lwVal);
+        }
         // 母版里 THEMEVAL(...) 的填充会随实例配色变化：Visio 把实例算好的颜色缓存
         // 在实例形状的 FillForegnd 里（组织图里是 #339933/#f09609/#1ba1e2/#d80073），
         // 而母版里存的仍是默认主题色 #638bad。这类"随主题"的子形状必须用实例色覆盖；
@@ -1566,6 +1624,14 @@ public static class VsdxParser
                                         $"instFill={instanceStyle.FillForegnd ?? "-"} fill={fill ?? "-"} " +
                                         $"themed={fillThemed}");
             if (fill != null || line != null) style = style.WithColors(fill, line);
+            // 实例显式声明的透明度优先于母版/样式链：母版继承来的样式常把
+            // FillForegndTrans 缓存成 0，会把实例设的半透明色条（如 db_schema 图例
+            // FillForegndTrans=0.7）覆盖成不透明。仅作用于根形状，子形状各有自己的值。
+            if (isRoot)
+            {
+                if (instanceStyle.FillTrans.HasValue) style.FillTrans = instanceStyle.FillTrans;
+                if (instanceStyle.LineTrans.HasValue) style.LineTrans = instanceStyle.LineTrans;
+            }
         }
         bool heading = IsHeadingShape(shape);
         // 标题条本身以及它的标题文字都放在「未纵向拉伸」的坐标系里，
@@ -1591,7 +1657,8 @@ public static class VsdxParser
         if (sub != null)
         {
             // 分组：先画自身几何（若有），再递归渲染子形状
-            RenderGeometry(useGeomOverride ? geomOv! : shape, MGeom, style, page, useGeomOverride ? shape : null);
+            RenderGeometry(useGeomOverride ? geomOv! : shape, MGeom, style, page, useGeomOverride ? shape : null,
+                stateSrc: useGeomOverride ? null : stateOverrides);
             foreach (var ch in sub.Elements().Where(e => e.Name.LocalName == "Shape"))
             {
                 // 母版内的 Foreign 子形状要用母版自己的 rels 找图片；
@@ -1599,12 +1666,14 @@ public static class VsdxParser
                 if ((string?)ch.Attribute("Type") == "Foreign")
                     RenderMasterImage(ch, Mh, page, masterId, masters, imageOverrides);
                 else RenderShape(ch, Mh, masters, page, style, masterId, textOverrides,
-                         fieldOverrides, geomOverrides, scaleSx, scaleSy, charOverrides, dimOverrides);
+                         fieldOverrides, geomOverrides, scaleSx, scaleSy, charOverrides, dimOverrides,
+                         lineWeightOverrides);
             }
         }
         else
         {
-            RenderGeometry(useGeomOverride ? geomOv! : shape, MGeom, style, page, useGeomOverride ? shape : null);
+            RenderGeometry(useGeomOverride ? geomOv! : shape, MGeom, style, page, useGeomOverride ? shape : null,
+                stateSrc: useGeomOverride ? null : stateOverrides);
         }
         // 文字：若实例重写了这个子形状，用实例的文字（位置仍按母版文本框）
         string? tOv = null;
@@ -1616,7 +1685,12 @@ public static class VsdxParser
         if (charOverrides != null && selfId != null) charOverrides.TryGetValue(selfId, out cSrc);
         XElement? tabSrc = null;
         if (dimOverrides != null && selfId != null) dimOverrides.TryGetValue(selfId, out tabSrc);
-        RenderText(shape, Mh, null, style, page, tOv, fSrc, cSrc, tabSrc);
+        // 母版根的占位文字（如脑图母版的 "New Topic"）被实例自身文字取代时跳过，
+        // 由 RenderShape 末尾按实例文本框锚点渲染，避免两份文字叠印。
+        bool instTextReplacesRoot = isRoot && stateOverrides != null &&
+            stateOverrides.Elements().Any(e => e.Name.LocalName == "Text");
+        if (!instTextReplacesRoot)
+            RenderText(shape, Mh, null, style, page, tOv, fSrc, cSrc, tabSrc);
 
         // 标题条要贴着容器顶边：把这段渲染出的图形和文字一起上移。
         if (heading && _headingTopScreen.HasValue)
@@ -1676,36 +1750,41 @@ public static class VsdxParser
             map[ms!] = c;
         }
 
-        // 两个子形状（表头/正文）时，实例常只缓存正文高度；表头高度 = 组高 - 正文高。
-        // 不补这一项，母版缓存的表头 0.278in 会被 sy 放大成半个表格。
-        var withHeight = children.Where(c =>
-            (string?)c.Attribute("MasterShape") != null && CellRaw(c, "Height") != null).ToList();
-        var withoutHeight = children.Where(c =>
-            (string?)c.Attribute("MasterShape") != null && CellRaw(c, "Height") == null).ToList();
-        if (withHeight.Count == 1 && withoutHeight.Count == 1)
+        // 通用规则：容器被纵向拉伸时，子形状高度常由容器高度派生（如标题行固定、
+        // 正文占满剩余空间）。若恰有一个 MasterShape 子形状没有实例缓存的 Height，
+        // 而其余子形状都缓存了，就用「容器高 - 已知高度之和」作为它的高度。
+        // 这适用于任意数量的堆叠子形状，不再假设只有「表头/正文」两段。
+        var sized = children
+            .Where(c => (string?)c.Attribute("MasterShape") != null)
+            .Select(c => (Child: c, Height: ParseDim(CellRaw(c, "Height"))))
+            .ToList();
+        var missing = sized.Where(s => !s.Height.HasValue).ToList();
+        if (sized.Count >= 2 && missing.Count == 1)
         {
             double rootH = GetDim(shape, "Height", null, 0);
-            var hRaw = CellRaw(withHeight[0], "Height");
-            if (rootH > 0 && hRaw != null &&
-                double.TryParse(hRaw, NF, CultureInfo.InvariantCulture, out var bodyH) &&
-                bodyH > 0 && rootH > bodyH)
+            double knownSum = sized.Where(s => s.Height.HasValue).Sum(s => s.Height!.Value);
+            double residual = rootH - knownSum;
+            if (rootH > 0 && residual > 1e-9 && residual < rootH)
             {
-                var header = new XElement(withoutHeight[0]);
-                var hCell = header.Elements().FirstOrDefault(e =>
+                var patched = new XElement(missing[0].Child);
+                var hCell = patched.Elements().FirstOrDefault(e =>
                     e.Name.LocalName == "Cell" && (string?)e.Attribute("N") == "Height");
                 if (hCell == null)
                 {
                     hCell = new XElement("Cell", new XAttribute("N", "Height"));
-                    header.Add(hCell);
+                    patched.Add(hCell);
                 }
-                hCell.SetAttributeValue("V", (rootH - bodyH).ToString("0.################", CultureInfo.InvariantCulture));
+                hCell.SetAttributeValue("V", residual.ToString("0.################", CultureInfo.InvariantCulture));
                 hCell.SetAttributeValue("U", "IN");
                 map ??= new Dictionary<string, XElement>(StringComparer.Ordinal);
-                map[(string)withoutHeight[0].Attribute("MasterShape")!] = header;
+                map[(string)missing[0].Child.Attribute("MasterShape")!] = patched;
             }
         }
         return map;
     }
+
+    private static double? ParseDim(string? raw)
+        => raw != null && double.TryParse(raw, NF, CultureInfo.InvariantCulture, out var d) ? d : null;
 
     /// <summary>旋转 ±90° 或带 HeadingPos 的标题条沿用母版几何，
     /// 不参与实例尺寸/几何回写（回写坐标轴与页面轴交叉，易把标题条拉长）。</summary>
@@ -1860,46 +1939,114 @@ public static class VsdxParser
         }
     }
 
-    private static readonly HashSet<string> UserFlagNames = new(StringComparer.Ordinal)
-    {
-        "PKCount", "DBHidePKSeperatorLine", "DBHideTabLine1", "DBHideTabLine2", "LineCount"
-    };
+    // 公式里对 User 行的引用：User.xxx（也覆盖 Sheet.N!User.xxx 这种跨形状写法）。
+    private static readonly Regex UserRefRegex =
+        new(@"User\.([A-Za-z_][A-Za-z0-9_]*)", RegexOptions.Compiled);
 
+    /// <summary>
+    /// 把实例 User 段里「母版副本公式实际引用到的」值带进副本。
+    /// Visio 允许子形状用 User 行驱动几何显隐（如 NoShow=OR(User.PKCount=-1, ...)），
+    /// 而这些值只写在实例上。不把它们带进母版副本，母版公式就求值失败、退回陈旧缓存。
+    /// 这里按引用关系按需复制，并对被复制行的公式做链式展开——任何用 User 行控制几何的
+    /// 母版模板都能生效，不必硬编码某个模板（如数据库模型）的具体字段名。
+    /// </summary>
     private static void CopyUserFlags(XElement src, XElement dst)
     {
         var srcSec = src.Elements().FirstOrDefault(e =>
             e.Name.LocalName == "Section" && (string?)e.Attribute("N") == "User");
         if (srcSec == null) return;
-        var dstSec = dst.Elements().FirstOrDefault(e =>
-            e.Name.LocalName == "Section" && (string?)e.Attribute("N") == "User");
-        if (dstSec == null)
+
+        var available = new Dictionary<string, XElement>(StringComparer.OrdinalIgnoreCase);
+        foreach (var row in srcSec.Elements().Where(e => e.Name.LocalName == "Row"))
         {
-            dstSec = new XElement(srcSec.Name, new XAttribute("N", "User"));
-            dst.Add(dstSec);
+            var n = (string?)row.Attribute("N");
+            if (!string.IsNullOrEmpty(n)) available[n!] = row;
         }
-        foreach (var srow in srcSec.Elements().Where(e => e.Name.LocalName == "Row"))
+        if (available.Count == 0) return;
+
+        var queue = new Queue<string>(CollectUserRefs(dst));
+        var handled = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+        XElement? dstSec = null;
+        while (queue.Count > 0)
         {
-            var name = (string?)srow.Attribute("N");
-            if (name == null || !UserFlagNames.Contains(name)) continue;
+            var name = queue.Dequeue();
+            if (!handled.Add(name)) continue;
+            if (!available.TryGetValue(name, out var srow)) continue;
+            // 长度类 User 值（User.Height/User.Width 等，单位 DL/IN/MM…）是实例本地英寸，
+            // 原样搬进母版副本会让依赖它的公式按错误量纲求值，文字/几何整体偏移。
+            // 这类量由母版自身公式与 ApplyDimensionOverride 处理，这里不复制。
+            if (!IsTransplantableUserValue(srow)) continue;
+
+            dstSec ??= dst.Elements().FirstOrDefault(e =>
+                e.Name.LocalName == "Section" && (string?)e.Attribute("N") == "User");
+            if (dstSec == null)
+            {
+                dstSec = new XElement(srcSec.Name, new XAttribute("N", "User"));
+                dst.Add(dstSec);
+            }
+
             var val = srow.Elements().FirstOrDefault(e =>
                 e.Name.LocalName == "Cell" && (string?)e.Attribute("N") == "Value")?.Attribute("V")?.Value;
-            if (val == null) continue;
-            var drow = dstSec.Elements().FirstOrDefault(e =>
-                e.Name.LocalName == "Row" && (string?)e.Attribute("N") == name);
-            if (drow == null)
+            if (val != null)
             {
-                drow = new XElement(srow.Name, new XAttribute("N", name));
-                dstSec.Add(drow);
+                var drow = dstSec.Elements().FirstOrDefault(e =>
+                    e.Name.LocalName == "Row" && (string?)e.Attribute("N") == name);
+                if (drow == null)
+                {
+                    drow = new XElement(srow.Name, new XAttribute("N", name));
+                    dstSec.Add(drow);
+                }
+                var dcell = drow.Elements().FirstOrDefault(e =>
+                    e.Name.LocalName == "Cell" && (string?)e.Attribute("N") == "Value");
+                if (dcell == null)
+                {
+                    dcell = new XElement("Cell", new XAttribute("N", "Value"));
+                    drow.Add(dcell);
+                }
+                dcell.SetAttributeValue("V", val);
             }
-            var dcell = drow.Elements().FirstOrDefault(e =>
-                e.Name.LocalName == "Cell" && (string?)e.Attribute("N") == "Value");
-            if (dcell == null)
-            {
-                dcell = new XElement("Cell", new XAttribute("N", "Value"));
-                drow.Add(dcell);
-            }
-            dcell.SetAttributeValue("V", val);
+
+            // 被复制行的公式可能再引用别的 User 行，继续展开。
+            foreach (var dep in CollectUserRefs(srow))
+                queue.Enqueue(dep);
         }
+    }
+
+    /// <summary>扫描元素内所有单元格公式（F），收集其中引用的 User 行名。</summary>
+    private static IEnumerable<string> CollectUserRefs(XElement el)
+    {
+        foreach (var cell in el.DescendantsAndSelf().Where(e => e.Name.LocalName == "Cell"))
+        {
+            var f = (string?)cell.Attribute("F");
+            if (string.IsNullOrEmpty(f)) continue;
+            foreach (Match m in UserRefRegex.Matches(f!))
+                yield return m.Groups[1].Value;
+        }
+    }
+
+    // 长度单位：这些 User 值随实例坐标缩放，不能原样搬进母版副本。
+    private static readonly HashSet<string> UserLengthUnits = new(StringComparer.OrdinalIgnoreCase)
+    {
+        "DL", "IN", "MM", "CM", "M", "FT", "MI", "YD", "PT", "PX", "PICA"
+    };
+
+    /// <summary>判断实例 User 值能否原样搬进母版副本。
+    /// 布尔（U=BOOL）与整数（开关/计数）跨坐标一致，可复制；长度类/比例类不可。</summary>
+    private static bool IsTransplantableUserValue(XElement row)
+    {
+        var vc = row.Elements().FirstOrDefault(e =>
+            e.Name.LocalName == "Cell" && (string?)e.Attribute("N") == "Value");
+        if (vc == null) return false;
+        var u = (string?)vc.Attribute("U");
+        if (u != null)
+        {
+            if (UserLengthUnits.Contains(u)) return false;
+            if (u.Equals("BOOL", StringComparison.OrdinalIgnoreCase)) return true;
+        }
+        // 无单位或其它单位：只有整数（开关/计数）才安全。
+        var v = (string?)vc.Attribute("V");
+        return v != null &&
+               int.TryParse(v.Trim(), NumberStyles.Integer, CultureInfo.InvariantCulture, out _);
     }
 
     private static void CopyTabStops(XElement src, XElement dst, double sx)
@@ -1944,6 +2091,29 @@ public static class VsdxParser
 
     /// <summary>收集实例对母版子形状的文字/字符样式覆盖：母版形状 ID → 实例子形状。
     /// 实例可改写文字（姓名）以及 Character 颜色/字号（姓名条用绿字）。</summary>
+    /// <summary>收集实例对母版子形状的线宽覆盖：母版形状 ID → 显式写了 LineWeight 的实例子形状。
+    /// Visio 会把用户在实例上改过的线宽缓存进实例子形状，而母版里仍存旧值（如电路图放大器/
+    /// 电阻的 0.0033in 细线 vs 实例 0.0417in 粗线）。全局套用实例线宽会破坏其他文档，
+    /// 这里只按 MasterShape 精确匹配、且实例确实显式写了 LineWeight 时才覆盖。</summary>
+    private static IReadOnlyDictionary<string, XElement>? BuildLineWeightOverrides(XElement shape)
+    {
+        var kids = shape.Elements().FirstOrDefault(e => e.Name.LocalName == "Shapes");
+        if (kids == null) return null;
+        Dictionary<string, XElement>? map = null;
+        foreach (var c in kids.Elements().Where(e => e.Name.LocalName == "Shape"))
+        {
+            var ms = (string?)c.Attribute("MasterShape");
+            if (string.IsNullOrEmpty(ms)) continue;
+            var lw = c.Elements().FirstOrDefault(e =>
+                e.Name.LocalName == "Cell" && (string?)e.Attribute("N") == "LineWeight");
+            var v = (string?)lw?.Attribute("V");
+            if (v == null || !double.TryParse(v, NF, CultureInfo.InvariantCulture, out _)) continue;
+            map ??= new Dictionary<string, XElement>(StringComparer.Ordinal);
+            map[ms!] = c;
+        }
+        return map;
+    }
+
     private static IReadOnlyDictionary<string, XElement>? BuildCharOverrides(XElement shape)
     {
         var kids = shape.Elements().FirstOrDefault(e => e.Name.LocalName == "Shapes");
@@ -2066,8 +2236,13 @@ public static class VsdxParser
     /// <summary>当前母版实例的顶边（屏幕坐标 Y）。标题条要贴着容器顶边放，不能跟着缩放跑。</summary>
     private static double? _headingTopScreen;
 
-    private static void RenderGeometry(XElement shape, Affine M, Style style, PageScene page, XElement? inh = null)
+    private static void RenderGeometry(XElement shape, Affine M, Style style, PageScene page, XElement? inh = null,
+        XElement? stateSrc = null)
     {
+        // stateSrc：段级 NoShow/NoFill/NoLine 状态的实例覆盖来源（按 IX 匹配）。
+        // Visio 的脑图/图解母版常备多个几何变体（椭圆版/矩形版/横线版），实例的 Geometry
+        // 段是空壳、只带 NoShow 用作变体开关（aspose_sample 的 Topic 节点）。此时几何画母版的，
+        // 但显隐必须按实例的 NoShow 决定；实例段未写 NoShow 的段才用母版值。
         // CFF 容器的标题条高在母版里是「字面量」（如 10mm≈0.394in），Visio 拉高容器时
         // 只拉伸主体、标题条保持原高。我们整体按 iH/Hm 缩放会把标题条一并拉高
         //（实测 0.394in→0.82in），于是表头下方多出一片蓝。这里对标题条取消纵向缩放。
@@ -2088,9 +2263,30 @@ public static class VsdxParser
         // Geometry 段的 NoShow=1 表示"这条路径不显示"。CFF 泳道模板把一堆辅助几何
         //（标题下方那条带弧线的深色块就是其中之一）标成 NoShow，Visio 不画，我们也必须跳过，
         // 否则泳道标题下面会多出一整条蓝带。
+        // 段级状态取值顺序：实例同 IX 段的显式值（stateSrc，变体开关）→ 段自身 →
+        // （仅当段无几何行时）母版同 IX 段。实例段有自己的几何行时不跨母版继承
+        //（与 OfficeIMO 一致——否则会误伤 office_plan 门框等实例改写几何的形状）。
+        string? SectionState(XElement sec, string cell)
+        {
+            string secN2 = (string?)sec.Attribute("N") ?? "Geometry";
+            string secIx2 = (string?)sec.Attribute("IX") ?? "";
+            if (stateSrc != null)
+            {
+                var ssec = FindMasterSectionByIX(stateSrc, secN2, secIx2);
+                var v = ssec?.Elements().FirstOrDefault(c =>
+                        c.Name.LocalName == "Cell" && (string?)c.Attribute("N") == cell)?.Attribute("V")?.Value;
+                if (v != null) return v;
+            }
+            var own = sec.Elements().FirstOrDefault(c =>
+                      c.Name.LocalName == "Cell" && (string?)c.Attribute("N") == cell)?.Attribute("V")?.Value;
+            if (own != null) return own;
+            if (sec.Elements().Any(e => e.Name.LocalName == "Row")) return null;
+            var msec2 = FindMasterSectionByIX(inh, secN2, secIx2);
+            return msec2?.Elements().FirstOrDefault(c =>
+                   c.Name.LocalName == "Cell" && (string?)c.Attribute("N") == cell)?.Attribute("V")?.Value;
+        }
         geomSections = geomSections
-            .Where(sec => sec.Elements().FirstOrDefault(c =>
-                       c.Name.LocalName == "Cell" && (string?)c.Attribute("N") == "NoShow")?.Attribute("V")?.Value != "1")
+            .Where(sec => SectionState(sec, "NoShow") != "1")
             .ToList();
         // RelMoveTo / RelLineTo 的 X/Y 是「相对形状宽高的归一化比例」（0..1），
         // 不是英寸偏移量。按英寸累加会把边框画到页面外（曾导致页面被撑到 19in 且顶部大片空白）。
@@ -2099,7 +2295,13 @@ public static class VsdxParser
         foreach (var sec in geomSections)
         {
             string secName = (string?)sec.Attribute("N") ?? "Geometry";
-            var msec = FindMasterSection(inh, secName);
+            string secIx = (string?)sec.Attribute("IX") ?? "";
+            var msec = FindMasterSectionByIX(inh, secName, secIx) ?? FindMasterSection(inh, secName);
+            // 实例段没有几何行时，几何行本体在母版对应段里（Visio 只在实例段声明 NoShow
+            // 等状态，aspose_sample 的 Topic 节点即此模式）。有行则用实例自己的行。
+            var secRows = sec.Elements().Where(e => e.Name.LocalName == "Row").ToList();
+            if (secRows.Count == 0 && msec != null)
+                secRows = msec.Elements().Where(e => e.Name.LocalName == "Row").ToList();
             // 几何区自带的 NoFill / NoLine 优先
             // 渐变填充（FillGradientEnabled=1）优先级高于 FillPattern=0：
             // ms_diagrams 的池 FillPattern=0 但有 FillGradient 段，仍要画出渐变。
@@ -2107,12 +2309,10 @@ public static class VsdxParser
             bool noFill = !hasGradient && (style.FillPattern == 0 ||
                           (style.FillTrans.HasValue && style.FillTrans.Value >= 0.99));
             bool noLine = style.LinePattern == 0;
-            var nf = sec.Elements().FirstOrDefault(c => c.Name.LocalName == "Cell" && (string?)c.Attribute("N") == "NoFill");
-            var nl = sec.Elements().FirstOrDefault(c => c.Name.LocalName == "Cell" && (string?)c.Attribute("N") == "NoLine");
             // NoFill=1 表示强制不填充；NoFill=0 只是"没有强制关闭"，真正的显隐仍由 FillPattern 决定。
             // 过去把 V='0' 当成"要填充"，导致 FillPattern=0 的文字形状（如页面大标题）被画成白底黑框。
-            if (nf != null && (string?)nf.Attribute("V") == "1") noFill = true;
-            if (nl != null && (string?)nl.Attribute("V") == "1") noLine = true;
+            if (SectionState(sec, "NoFill") == "1") noFill = true;
+            if (SectionState(sec, "NoLine") == "1") noLine = true;
 
             string? fill = noFill ? null : (style.FillForegnd ?? "#FFFFFF");
             string? stroke = noLine ? null : (style.LineColor ?? "#000000");
@@ -2121,7 +2321,8 @@ public static class VsdxParser
             {
                 string gix = (string?)sec.Attribute("IX") ?? "";
                 Console.Error.WriteLine($"  [geom] ID={shape.Attribute("ID")?.Value} sec={secName}/{gix} " +
-                                        $"fill={fill ?? "-"} pat={style.FillPattern ?? 1} bg={style.FillBkgnd ?? "-"} stroke={stroke ?? "-"} noFill={noFill} noLine={noLine} " +
+                                        $"fill={fill ?? "-"} pat={style.FillPattern ?? 1} bg={style.FillBkgnd ?? "-"} stroke={stroke ?? "-"} " +
+                                        $"lw={(style.LineWeight ?? 0).ToString("0.####", CultureInfo.InvariantCulture)} noFill={noFill} noLine={noLine} " +
                                         $"gw={gw.ToString("0.###", CultureInfo.InvariantCulture)} " +
                                         $"gh={gh.ToString("0.###", CultureInfo.InvariantCulture)}");
             }
@@ -2130,13 +2331,10 @@ public static class VsdxParser
                 ? style.LineWeight.Value : 0.0104; // 缺省约 0.75pt
             double strokeW = lw; // LineWeight 的 V 已是英寸（0.01in ≈ 0.72pt），不要再 ÷72
 
-            // Visio 的 Trans 是「透明度」(0..1)：参考渲染里 0.7/0.95 的浅色分区
-            // 实际是 fill-opacity 0.3/0.05，整个模型此前丢掉了这个通道，导致深蓝/紫色块。
-            // 但 svgpublish 参考导出对高透明度有视觉下限（db_schema 的 Trans=0.95
-            // 色块实际是 fill-opacity 0.25/0.3 而非 0.05）——否则分区淡到几乎看不见。
-            // 取 0.25 下限：0.7→0.3 不变，0.95→0.25 接近参考。
+            // Visio 的 Trans 是「透明度」(0..1)，不透明度 = 1 - Trans，按规范直接映射。
+            // 不再为对齐某个参考导出而设人为下限（那会把高透明色块强行画得更实）。
             double Opacity(double? trans)
-                => trans.HasValue ? Math.Clamp(Math.Max(1 - trans.Value, 0.25), 0, 1) : 1;
+                => trans.HasValue ? Math.Clamp(1 - trans.Value, 0, 1) : 1;
 
             var path = new PathDrawable
             {
@@ -2172,8 +2370,10 @@ public static class VsdxParser
             }
 
             double curX = 0, curY = 0;
-            foreach (var row in sec.Elements().Where(e => e.Name.LocalName == "Row"))
+            foreach (var row in secRows)
             {
+                // Del='1' 是已删除的几何行，不能渲染（否则多画线段形成折线/楔形）。
+                if ((string?)row.Attribute("Del") == "1") continue;
                 var t = (string?)row.Attribute("T") ?? "LineTo";
                 // 母版同行（用于补齐实例行里缺失的单元格）
                 var mrow = FindMasterRow(msec, row);
@@ -2316,8 +2516,61 @@ public static class VsdxParser
             }
 
             if (path.Commands.Count == 0) continue;
+            // 开放路径（首尾不重合、也没有 Close）只应描边，不能填充。
+            // WPF/SVG 会把未闭合的子路径隐式连回起点再填充：单条 ArcTo 于是变成「弓形」
+            // （弦+弧围出的凸透镜）。office_plan 的弧形墙线框子形状（MasterShape=10 的
+            // MoveTo(0,0)+ArcTo(340,A=70.85)）就靠 FillPattern=1 被填成巨大凸透镜，
+            // 盖住下方圆桌；参考图里它只是墙的边界线。真正的粗弧线是另一子形状的完整
+            // 闭合双弧环带（MasterShape=6），不应被这条开放弧的填充破坏。
+            // 只针对含曲线的开放路径：纯直线段（门对角线、座位小标记等）本身面积接近 0，
+            // 但其填充常被用来显示小圆点/端点标记，一律去掉会误伤 seats 的座位标记。
+            bool hasCurve = path.Commands.Any(c => c is _Arc or _Quad or _Cubic);
+            if (path.Fill != null && hasCurve && !IsClosedPath(path.Commands))
+            {
+                if (Trace)
+                    Console.Error.WriteLine($"  [open-unfill] ID={shape.Attribute("ID")?.Value} sec={secName} " +
+                                            $"was fill={path.Fill} cmds={path.Commands.Count}");
+                path.Fill = null;
+                path.GradientStops = null;
+                path.FillPatternIndex = 1;
+                path.FillBkgnd = null;
+            }
             page.Drawables.Add(path);
         }
+    }
+
+    /// <summary>
+    /// 判断低层路径是否构成闭合区域：显式 Close，或最后一个绘制命令的终点回到首个 MoveTo 起点。
+    /// 仅用于决定开放路径能否填充——单条开放弧填充后会隐式闭合成弓形（凸透镜），是错误的。
+    /// </summary>
+    private static bool IsClosedPath(IReadOnlyList<ILowCmd> cmds)
+    {
+        double startX = 0, startY = 0, endX = 0, endY = 0;
+        bool haveStart = false, haveEnd = false;
+        foreach (var c in cmds)
+        {
+            switch (c)
+            {
+                case _Close:
+                    return true;
+                case _Move m:
+                    // 多段子路径时以最近的 MoveTo 为起点
+                    startX = m.X; startY = m.Y; haveStart = true;
+                    break;
+                case _Line l:
+                    endX = l.X; endY = l.Y; haveEnd = true; break;
+                case _Arc a:
+                    endX = a.X; endY = a.Y; haveEnd = true; break;
+                case _Quad q:
+                    endX = q.X; endY = q.Y; haveEnd = true; break;
+                case _Cubic cu:
+                    endX = cu.X; endY = cu.Y; haveEnd = true; break;
+                case _Ellipse:
+                    return true; // 椭圆自身闭合
+            }
+        }
+        if (!haveStart || !haveEnd) return false;
+        return Math.Abs(startX - endX) < 1e-3 && Math.Abs(startY - endY) < 1e-3;
     }
 
     /// <summary>把一条路径在屏幕坐标里整体上下平移。</summary>
@@ -2431,6 +2684,25 @@ public static class VsdxParser
         double rotDeg = rotRad * 180.0 / Math.PI;
         if (Math.Abs(rotDeg) < 0.05) rotDeg = 0;
 
+        // 文字样式沿母版 TextStyle 链回退：形状/实例没写 TextStyle 时颜色字号可能缺失
+        //（aspose 脑图 Topic 节点的蓝色在母版根 TextStyle=30 里，实例只有 Text 文本）。
+        if (inh != null && (style.TextColor == null || !style.CharSize.HasValue))
+        {
+            var mText = (string?)inh.Attribute("TextStyle");
+            if (mText != null)
+            {
+                if (style.TextColor == null) style.TextColor = StyleColor(mText, "Color");
+                if (!style.CharSize.HasValue)
+                {
+                    var sz0 = StyleCellRaw(mText, "Size");
+                    if (sz0 != null && double.TryParse(sz0, NF, CultureInfo.InvariantCulture, out var z0))
+                    {
+                        var fsr0 = StyleDim(mText, "FontScale") ?? 1;
+                        style.CharSize = z0 * (fsr0 > 1e-6 ? fsr0 : 1);
+                    }
+                }
+            }
+        }
         var td = new TextDrawable
         {
             Text = text,
@@ -2466,19 +2738,28 @@ public static class VsdxParser
 
         // 文字框（页面坐标）：缺省 TxtPin 在框中心，所以框四角是 pin ± TxtWidth/2、pin ± TxtHeight/2。
         // 左/上对齐时按这个框定位，而不是把整块文字围绕 TxtPin 居中。
-        double th = GetDim(shape, "TxtHeight", inh, 0);
+        double thCell = GetDim(shape, "TxtHeight", inh, 0);
+        double th = thCell;
         // TxtHeight 极小（≈0）时视为缺失，回退到形状高度；正常单行文本高度（0.13in≈9.6pt）不能吞。
         if (th < 0.01) th = frameH > 0.01 ? frameH : ownH;
+        // 文本块是否等于整个形状框（没有显式 TxtHeight，或显式值恰为形状高）。
+        bool textBoxFillsShape = thCell < 0.01 || Math.Abs(th - frameH) < 1e-6;
         // 非表格的矮文本框（标题/标签）回到基线版的垂直居中，避免标题被顶到框外；
         // db_schema 的区域标签框很高，仍保持 Visio 的顶部对齐。
         if (tabStops == null && th < 0.8 && td.VerticalAlignment == 0)
             td.VerticalAlignment = 1;
         if (Math.Abs(rotDeg) < 0.05 && tw > 0.15 && th > 0.01)
         {
-            // Visio 的 TxtPin 是文字锚点：va=0 锚在文字顶部、va=1 在中间、va=2 在底部。
-            // 文本框必须按锚点位置偏移——否则 va=2 时框居中于锚点，文字会向下溢出到
-            // 白色名字条区域（orgchart 的 "President & CEO" 被白条盖住）。
-            double anchorShift = td.VerticalAlignment switch { 0 => -th / 2, 2 => th / 2, _ => 0 };
+            // 文本块以 TxtPin 为中心。当它是整个形状框时，垂直对齐只决定文字在块内的
+            // 位置，由渲染器按 VerticalAlignment 处理，不能再平移（旧实现额外平移半框高，
+            // 使 va=0 的表格正文整体下移、越过实体框底部——db_schema 几乎所有文字错位）。
+            // 只有显式的小文本框（如组织图职位）才保留按 va 平移锚点的旧行为。
+            double anchorShift = textBoxFillsShape ? 0 : td.VerticalAlignment switch
+            {
+                0 => -th / 2,
+                2 => th / 2,
+                _ => 0
+            };
             var topLeft = ownM.Apply(tx - tw / 2, ty + th / 2 + anchorShift);
             var botRight = ownM.Apply(tx + tw / 2, ty - th / 2 + anchorShift);
             double ml = Math.Max(0, GetDim(shape, "LeftMargin", inh, 0));
@@ -2504,7 +2785,8 @@ public static class VsdxParser
             Console.Error.WriteLine($"  [text] ID={shape.Attribute("ID")?.Value} ov={textOverride != null} " +
                                     $"c=({sx:0.##},{sy:0.##}) fs={td.FontSize:0.####} color={td.Color} " +
                                     $"mw={td.MaxWidth:0.##} ha={td.HorizontalAlignment} va={td.VerticalAlignment} " +
-                                    $"box={(td.BoxLeft.HasValue ? $"({td.BoxLeft:0.##},{td.BoxTop:0.##},{td.BoxWidth:0.##})" : "-")} " +
+                                    $"th={th:0.###} tw={tw:0.###} " +
+                                    $"box={(td.BoxLeft.HasValue ? $"({td.BoxLeft:0.##},{td.BoxTop:0.##},{td.BoxWidth:0.##},{td.BoxHeight:0.##})" : "-")} " +
                                     $"org=({ownM.Apply(0, 0).X:0.##},{ownM.Apply(0, 0).Y:0.##}) " +
                                     $"tabs={td.TabStops?.Count ?? 0} '{text.Replace("\n", " ")}'");
         // 文字实际占位：按字数估算宽高，让页面包围盒把文字也算进去（否则贴边文字被裁掉）
@@ -2591,13 +2873,17 @@ public static class VsdxParser
         if (c == null) return false;
         var f = (string?)c.Attribute("F");
         if (f == "Inh" || f == "INH") return false;
-        var s = (string?)c.Attribute("V");
-        if (s != null && double.TryParse(s, NF, CultureInfo.InvariantCulture, out v)) return true;
-        if (f != null && el != null)
+        // 公式优先、缓存值兜底：V 只是 Visio 上次求值的缓存，条件变化后会过期
+        //（aspose 脑图母版的 TxtPinY=IF(NOT(Geometry4.NoShow),Height*1.05,Height*0.5)，
+        // 缓存的是装饰可见时的 0.525，而实例已隐藏装饰、实际应为 Height*0.5=0.25）。
+        if (f != null && f.Trim().Length > 0 &&
+            !f.Trim().Equals("No Formula", StringComparison.OrdinalIgnoreCase) && el != null)
         {
             var ev = EvalFormula(f, el, null);
             if (ev.HasValue) { v = ev.Value; return true; }
         }
+        var s = (string?)c.Attribute("V");
+        if (s != null && double.TryParse(s, NF, CultureInfo.InvariantCulture, out v)) return true;
         return false;
     }
 
@@ -2764,6 +3050,7 @@ public static class VsdxParser
             double curX = 0, curY = 0;
             foreach (var row in sec.Elements().Where(e => e.Name.LocalName == "Row"))
             {
+                if ((string?)row.Attribute("Del") == "1") continue; // 已删除的几何行不参与测量
                 var t = (string?)row.Attribute("T") ?? "LineTo";
                 double x, y;
                 switch (t)
@@ -2966,6 +3253,15 @@ public static class VsdxParser
             e.Name.LocalName == "Section" && (string?)e.Attribute("N") == name);
     }
 
+    /// <summary>按名字 + IX 精确匹配母版几何段（母版同名 Geometry 段有多个，IX 各不相同）。</summary>
+    private static XElement? FindMasterSectionByIX(XElement? inh, string name, string? ix)
+    {
+        if (inh == null) return null;
+        return inh.Elements().FirstOrDefault(e =>
+            e.Name.LocalName == "Section" && (string?)e.Attribute("N") == name &&
+            (((string?)e.Attribute("IX")) ?? "") == (ix ?? ""));
+    }
+
     /// <summary>
     /// 实例是否带有「完整」几何：母版里每个 Geometry 段在实例里都有同名段，且实例段的行数
     /// 不少于母版段。少行说明实例只做了局部覆盖（其余靠继承），此时必须走母版几何。
@@ -3009,6 +3305,9 @@ public static class VsdxParser
         f = f.Trim();
         if (f == "No Formula" || f == "no formula") return 0;
         if (f == "Inh" || f == "INH") return null;
+        // GUARD(x) 只是防手改标记，不影响取值
+        if (f.StartsWith("GUARD(", StringComparison.OrdinalIgnoreCase) && f.EndsWith(")"))
+            f = f.Substring(6, f.Length - 7).Trim();
 
         // IF(cond, a, b)
         if (f.StartsWith("IF(", StringComparison.OrdinalIgnoreCase))
@@ -3025,16 +3324,16 @@ public static class VsdxParser
             }
         }
 
-        // 形如 Width*0.5 / Sheet.5!Height*1 / Width*3.64432142E-6（系数可带科学计数法）
-        var m = Regex.Match(f, @"(?:Sheet\.\d+!)?([A-Za-z_][A-Za-z0-9_]*)\s*\*\s*([0-9]*\.?[0-9]+(?:[eE][-+]?\d+)?)");
+        // 形如 Width*0.5 / User.Margin*2 / Geometry4.NoShow*1（名字可带 User./GeometryN. 前缀）
+        var m = Regex.Match(f, @"(?:Sheet\.\d+!)?([A-Za-z_][A-Za-z0-9_]*(?:\.[A-Za-z_][A-Za-z0-9_]*)?)\s*\*\s*([0-9]*\.?[0-9]+(?:[eE][-+]?\d+)?)");
         if (m.Success)
         {
             if (!double.TryParse(m.Groups[2].Value, NF, CultureInfo.InvariantCulture, out var k)) return null;
             var baseVal = ResolveName(owner, m.Groups[1].Value, inh);
             return baseVal.HasValue ? baseVal.Value * k : (double?)null;
         }
-        // 单独的名字（如 Width）
-        var m2 = Regex.Match(f, @"(?:Sheet\.\d+!)?([A-Za-z_][A-Za-z0-9_]*)");
+        // 单独的名字（如 Width / User.TextStacked / Geometry4.NoShow）
+        var m2 = Regex.Match(f, @"(?:Sheet\.\d+!)?([A-Za-z_][A-Za-z0-9_]*(?:\.[A-Za-z_][A-Za-z0-9_]*)?)");
         if (m2.Success && m2.Length == f.Length)
             return ResolveName(owner, m2.Groups[1].Value, inh);
 
@@ -3062,6 +3361,31 @@ public static class VsdxParser
     private static bool FormulaIsTrue(string expr, XElement owner)
     {
         expr = expr.Trim();
+        // NOT(x)
+        if (expr.StartsWith("NOT(", StringComparison.OrdinalIgnoreCase) && expr.EndsWith(")"))
+            return !FormulaIsTrue(expr.Substring(4, expr.Length - 5), owner);
+        // 比较：a=b / a<>b / a<b / a>b / a<=b / a>=b
+        var cm = Regex.Match(expr, @"^(.+?)\s*(<=|>=|<>|!=|=|<|>)\s*(.+)$");
+        if (cm.Success)
+        {
+            var l = EvalFormula(cm.Groups[1].Value, owner, null);
+            var r = EvalFormula(cm.Groups[3].Value, owner, null);
+            if (l.HasValue && r.HasValue)
+            {
+                double a = l.Value, b = r.Value;
+                switch (cm.Groups[2].Value)
+                {
+                    case "=": return Math.Abs(a - b) < 1e-9;
+                    case "<>":
+                    case "!=": return Math.Abs(a - b) >= 1e-9;
+                    case "<": return a < b;
+                    case ">": return a > b;
+                    case "<=": return a <= b;
+                    case ">=": return a >= b;
+                }
+            }
+            return false;
+        }
         if (expr.IndexOf("FlipX", StringComparison.OrdinalIgnoreCase) >= 0)
             return GetDim(owner, "FlipX", null, 0) != 0;
         if (expr.IndexOf("FlipY", StringComparison.OrdinalIgnoreCase) >= 0)
@@ -3074,6 +3398,51 @@ public static class VsdxParser
 
     private static double? ResolveName(XElement owner, string nm, XElement? inh)
     {
+        // Sheet.N! 前缀：跨形状引用（这里简化为本形状同名单元格，拿不到就返回 null 回落缓存）
+        var sm = Regex.Match(nm, @"^Sheet\.\d+!(.+)$", RegexOptions.IgnoreCase);
+        if (sm.Success) nm = sm.Groups[1].Value;
+        // User.xxx：User 段的自定义值（orgchart 的 TextStacked/Visible/Theme、脑图的 shapelook）
+        if (nm.StartsWith("User.", StringComparison.OrdinalIgnoreCase))
+        {
+            var uname = nm.Substring(5);
+            foreach (var src in new[] { owner, inh })
+            {
+                if (src == null) continue;
+                foreach (var sec in src.Elements().Where(e =>
+                             e.Name.LocalName == "Section" && (string?)e.Attribute("N") == "User"))
+                    foreach (var row in sec.Elements().Where(e => e.Name.LocalName == "Row"))
+                        if (string.Equals((string?)row.Attribute("N"), uname, StringComparison.OrdinalIgnoreCase))
+                        {
+                            var vc = row.Elements().FirstOrDefault(c =>
+                                     c.Name.LocalName == "Cell" && (string?)c.Attribute("N") == "Value");
+                            var s = (string?)vc?.Attribute("V");
+                            if (s != null && double.TryParse(s, NumberStyles.Float, CultureInfo.InvariantCulture, out var uv))
+                                return uv;
+                        }
+            }
+            return null;
+        }
+        // GeometryN.Cell：几何段的段级单元格（NoShow/NoFill/NoLine）——
+        // aspose 脑图母版的 TxtPinY/VerticalAlign 靠 Geometry4.NoShow 切换布局变体
+        var gm = Regex.Match(nm, @"^Geometry(\d+)\.(.+)$", RegexOptions.IgnoreCase);
+        if (gm.Success)
+        {
+            string gix = gm.Groups[1].Value, gcell = gm.Groups[2].Value;
+            foreach (var src in new[] { owner, inh })
+            {
+                if (src == null) continue;
+                var gsec = src.Elements().FirstOrDefault(e =>
+                    e.Name.LocalName == "Section" &&
+                    ((string?)e.Attribute("N") ?? "").StartsWith("Geometry", StringComparison.Ordinal) &&
+                    (((string?)e.Attribute("IX")) ?? "") == gix);
+                var vc = gsec?.Elements().FirstOrDefault(c =>
+                         c.Name.LocalName == "Cell" && (string?)c.Attribute("N") == gcell);
+                var s = (string?)vc?.Attribute("V");
+                if (s != null && double.TryParse(s, NumberStyles.Float, CultureInfo.InvariantCulture, out var gv))
+                    return gv;
+            }
+            return null;
+        }
         switch (nm.ToLowerInvariant())
         {
             case "width": return GetDimNullable(owner, "Width", inh);
@@ -3153,9 +3522,14 @@ public static class VsdxParser
 
     private static Style ReadStyle(XElement shape, Style? inherited, XElement? inh)
     {
-        var lineStyle = (string?)shape.Attribute("LineStyle");
-        var fillStyle = (string?)shape.Attribute("FillStyle");
-        var textStyle = (string?)shape.Attribute("TextStyle");
+        // 样式引用缺失时沿母版回退（Visio 语义）：aspose 脑图的连接线实例没写 LineStyle，
+        // 颜色在母版的 LineStyle=14（#0033cc 蓝），丢了回退就会画成黑色。
+        var lineStyle = (string?)shape.Attribute("LineStyle")
+                        ?? (inh != null ? (string?)inh.Attribute("LineStyle") : null);
+        var fillStyle = (string?)shape.Attribute("FillStyle")
+                        ?? (inh != null ? (string?)inh.Attribute("FillStyle") : null);
+        var textStyle = (string?)shape.Attribute("TextStyle")
+                        ?? (inh != null ? (string?)inh.Attribute("TextStyle") : null);
         var st = new Style();
         st.FillForegnd = GetColor(shape, "FillForegnd", inh) ?? StyleColor(fillStyle, "FillForegnd");
         st.FillBkgnd = GetColor(shape, "FillBkgnd", inh) ?? StyleColor(fillStyle, "FillBkgnd");
@@ -3163,6 +3537,12 @@ public static class VsdxParser
         st.FillPattern = CellInt(shape, "FillPattern") ?? StyleInt(fillStyle, "FillPattern");
         st.LinePattern = CellInt(shape, "LinePattern") ?? StyleInt(lineStyle, "LinePattern");
         st.LineWeight = GetDimNullable(shape, "LineWeight", inh) ?? StyleDim(lineStyle, "LineWeight");
+        // 箭头：Connector 样式用 "Themed" 表示主题线端。Visio 默认主题只有终点箭头
+        // （实心三角，索引 13），起点无箭头；大小 "Themed" 归一到中等（等级 2）。
+        st.BeginArrow = ResolveArrow(shape, inh, "BeginArrow", 0);
+        st.EndArrow = ResolveArrow(shape, inh, "EndArrow", 13);
+        st.BeginArrowSize = ResolveArrow(shape, inh, "BeginArrowSize", 2);
+        st.EndArrowSize = ResolveArrow(shape, inh, "EndArrowSize", 2);
         st.FillTrans = GetDimNullable(shape, "FillForegndTrans", inh) ?? StyleDim(fillStyle, "FillForegndTrans");
         st.LineTrans = GetDimNullable(shape, "LineColorTrans", inh) ?? StyleDim(lineStyle, "LineColorTrans");
         st.GradientAngle = GetDim(shape, "FillGradientAngle", null, Math.PI / 2);
@@ -3170,6 +3550,25 @@ public static class VsdxParser
         // 池背景（ms_diagrams）就是这种：FillPattern=0 但 FillGradientEnabled=1。
         if (CellInt(shape, "FillGradientEnabled") == 1)
             st.GradientStops = ReadGradient(shape, inh);
+        // 文字样式沿 TextStyle 链回退：形状没有 Character 段时也要取到颜色/字号
+        //（aspose 脑图 Topic 节点无 Character，蓝色在母版 TextStyle=30 里；
+        // 旧实现只在有 Character 段时读样式链，这些节点文字全部掉成黑色）。
+        st.TextColor = StyleColor(textStyle, "Color");
+        {
+            var sz0 = StyleCellRaw(textStyle, "Size");
+            if (sz0 != null && double.TryParse(sz0, NF, CultureInfo.InvariantCulture, out var z0))
+            {
+                var fsr0 = StyleDim(textStyle, "FontScale") ?? 1;
+                st.CharSize = z0 * (fsr0 > 1e-6 ? fsr0 : 1);
+            }
+            st.FontFamily = ResolveFontName(StyleCellRaw(textStyle, "Font"));
+            var sty0 = StyleCellRaw(textStyle, "Style");
+            if (sty0 != null && int.TryParse(sty0, NumberStyles.Integer, CultureInfo.InvariantCulture, out var bits0))
+            {
+                if ((bits0 & 1) != 0) st.Bold = true;
+                if ((bits0 & 2) != 0) st.Italic = true;
+            }
+        }
         var ch = shape.Elements().FirstOrDefault(e =>
             e.Name.LocalName == "Section" &&
             ((string?)e.Attribute("N") == "Character" || (string?)e.Attribute("N") == "Character1"));
@@ -3286,6 +3685,13 @@ public static class VsdxParser
         var row = sec?.Elements().FirstOrDefault(e => e.Name.LocalName == "Row");
         var cell = row?.Elements().FirstOrDefault(c =>
             c.Name.LocalName == "Cell" && (string?)c.Attribute("N") == name);
+        var f = (string?)cell?.Attribute("F");
+        if (f != null && f.Trim().Length > 0 && !f.Equals("Inh", StringComparison.OrdinalIgnoreCase) &&
+            !f.Trim().Equals("No Formula", StringComparison.OrdinalIgnoreCase))
+        {
+            var ev = EvalFormula(f, el, null);
+            if (ev.HasValue) return (int)Math.Round(ev.Value);
+        }
         var v = (string?)cell?.Attribute("V");
         return v != null && int.TryParse(v, NumberStyles.Integer, CultureInfo.InvariantCulture, out var n)
             ? n : null;
@@ -3415,6 +3821,17 @@ public static class VsdxParser
 
     private static int? CellInt(XElement el, string name)
     {
+        // 公式优先、缓存值兜底（同 TryCellNumber）：VerticalAlign 等单元格的 V 是旧缓存
+        //（脑图母版 VerticalAlign=IF(NOT(Geometry4.NoShow),2,1)，装饰隐藏后实际应为 1）。
+        var c = el.Elements().FirstOrDefault(x =>
+            x.Name.LocalName == "Cell" && (string?)x.Attribute("N") == name);
+        var f = (string?)c?.Attribute("F");
+        if (f != null && f.Trim().Length > 0 && !f.Equals("Inh", StringComparison.OrdinalIgnoreCase) &&
+            !f.Trim().Equals("No Formula", StringComparison.OrdinalIgnoreCase))
+        {
+            var ev = EvalFormula(f, el, null);
+            if (ev.HasValue) return (int)Math.Round(ev.Value);
+        }
         var v = CellVal(el, name);
         if (v == null) return null;
         return int.TryParse(v, NumberStyles.Integer, CultureInfo.InvariantCulture, out var i) ? i : null;

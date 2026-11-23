@@ -25,6 +25,13 @@ public class Style
     public double GradientAngle { get; set; }
     public int? LinePattern { get; set; }
     public double? LineWeight { get; set; }
+    /// <summary>起点箭头类型（Visio 索引：0=无、1=简单箭头、4/5/13=实心三角）。</summary>
+    public int? BeginArrow { get; set; }
+    /// <summary>终点箭头类型（同上）。</summary>
+    public int? EndArrow { get; set; }
+    /// <summary>箭头大小等级 0..6（Visio 单元格 BeginArrowSize/EndArrowSize）。</summary>
+    public int? BeginArrowSize { get; set; }
+    public int? EndArrowSize { get; set; }
     public double? FillTrans { get; set; }
     /// <summary>线条透明度（LineColorTrans），0=不透明，1=全透明。</summary>
     public double? LineTrans { get; set; }
@@ -50,6 +57,10 @@ public class Style
             GradientAngle = GradientAngle,
             LinePattern = LinePattern,
             LineWeight = LineWeight,
+            BeginArrow = BeginArrow,
+            EndArrow = EndArrow,
+            BeginArrowSize = BeginArrowSize,
+            EndArrowSize = EndArrowSize,
             FillTrans = FillTrans,
             LineTrans = LineTrans,
             TextColor = TextColor ?? other.TextColor,
@@ -72,6 +83,10 @@ public class Style
         GradientAngle = GradientAngle,
         LinePattern = LinePattern,
         LineWeight = LineWeight,
+        BeginArrow = BeginArrow,
+        EndArrow = EndArrow,
+        BeginArrowSize = BeginArrowSize,
+        EndArrowSize = EndArrowSize,
         FillTrans = FillTrans,
         LineTrans = LineTrans,
         CharSize = CharSize,
@@ -82,6 +97,30 @@ public class Style
 
     /// <summary>复制本样式，但填充/线条颜色改用 source 的值（实例缓存颜色覆盖母版固定色）。</summary>
     public Style WithColorFrom(Style source) => WithColors(source.FillForegnd, source.LineColor);
+
+    /// <summary>复制本样式，只替换线宽（实例子形状缓存的线宽覆盖母版旧值）。</summary>
+    public Style WithLineWeight(double? weight) => new()
+    {
+        FillForegnd = FillForegnd,
+        FillBkgnd = FillBkgnd,
+        LineColor = LineColor,
+        TextColor = TextColor,
+        FillPattern = FillPattern,
+        GradientStops = GradientStops,
+        GradientAngle = GradientAngle,
+        LinePattern = LinePattern,
+        LineWeight = weight ?? LineWeight,
+        BeginArrow = BeginArrow,
+        EndArrow = EndArrow,
+        BeginArrowSize = BeginArrowSize,
+        EndArrowSize = EndArrowSize,
+        FillTrans = FillTrans,
+        LineTrans = LineTrans,
+        CharSize = CharSize,
+        Bold = Bold,
+        Italic = Italic,
+        FontFamily = FontFamily,
+    };
 
     /// <summary>合并回退：本样式优先，缺失项取 other。</summary>
     public Style Merge(Style? other)
@@ -98,6 +137,10 @@ public class Style
             GradientAngle = GradientStops != null ? GradientAngle : other.GradientAngle,
             LinePattern = LinePattern ?? other.LinePattern,
             LineWeight = LineWeight ?? other.LineWeight,
+            BeginArrow = BeginArrow ?? other.BeginArrow,
+            EndArrow = EndArrow ?? other.EndArrow,
+            BeginArrowSize = BeginArrowSize ?? other.BeginArrowSize,
+            EndArrowSize = EndArrowSize ?? other.EndArrowSize,
             FillTrans = FillTrans ?? other.FillTrans,
             LineTrans = LineTrans ?? other.LineTrans,
             CharSize = CharSize ?? other.CharSize,

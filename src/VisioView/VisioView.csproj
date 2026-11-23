@@ -17,9 +17,9 @@
     <ApplicationDisplayName>VisioView</ApplicationDisplayName>
     <Product>VisioView</Product>
     <Description>轻量 .vsdx（Visio）查看器，支持导出 PNG / JPEG</Description>
-    <Version>1.5.2</Version>
-    <FileVersion>1.5.2.0</FileVersion>
-    <AssemblyVersion>1.5.2.0</AssemblyVersion>
+    <Version>1.5.3</Version>
+    <FileVersion>1.5.3.0</FileVersion>
+    <AssemblyVersion>1.5.3.0</AssemblyVersion>
     <RootNamespace>VisioView</RootNamespace>
     <!-- 写入 exe 的 Win32 图标资源（资源管理器 / 任务栏 / 文件关联显示的就是它） -->
     <ApplicationIcon>../../assets/VisioView.ico</ApplicationIcon>
