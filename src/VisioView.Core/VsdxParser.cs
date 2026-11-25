@@ -950,7 +950,12 @@ public static class VsdxParser
         var selfId0 = (string?)shape.Attribute("ID");
         if (geomOverrides != null && selfId0 != null) geomOverrides.TryGetValue(selfId0, out geomOv);
         if (SuppressInstanceOverrides(effShape)) geomOv = null;
-        if (geomOv != null && scaleSx > 1e-9 && scaleSy > 1e-9 && HasCompleteInstanceGeometry(geomOv!, effShape))
+        bool useInstGeom2 = geomOv != null && scaleSx > 1e-9 && scaleSy > 1e-9 &&
+                            HasCompleteInstanceGeometry(geomOv!, effShape) &&
+                            // 原样继承（F="Inh"）的拷贝不带母版段级 NoShow，直接画会多出
+                            // 隐藏变体段（电路图放大器/电阻的多余线条），应回退母版几何。
+                            !IsInheritedGeometryCopy(geomOv!);
+        if (useInstGeom2)
         {
             var MNoScale = Affine.Compose(Mh, LocalScaleInverse(effShape, scaleSx, scaleSy));
             RenderGeometry(geomOv!, MNoScale, style2, page, effShape);
@@ -1648,6 +1653,15 @@ public static class VsdxParser
         if (SuppressInstanceOverrides(shape)) geomOv = null;
         bool useGeomOverride = geomOv != null && scaleSx > 1e-9 && scaleSy > 1e-9 &&
                                HasCompleteInstanceGeometry(geomOv!, shape);
+        // 实例子形状若只是把母版几何原样拷贝过来（所有坐标单元格都是 F="Inh"），
+        // 拷贝里不会带母版段级的 NoShow/NoFill/NoLine，直接画拷贝会把母版的
+        // 隐藏变体段也画出来（circuit_schematic 放大器多余的横线、电阻多出的
+        // 45° 斜杠箭头即此）。这类拷贝应回退到母版几何，让段级 NoShow 生效——
+        // 与 OfficeIMO 对同款文件的处理一致。实例真正改写过坐标（非 Inh）时仍用实例几何。
+        if (useGeomOverride && IsInheritedGeometryCopy(geomOv!))
+        {
+            useGeomOverride = false;
+        }
         var MGeom = useGeomOverride
             ? Affine.Compose(Mh, LocalScaleInverse(geomOv!, scaleSx, scaleSy))
             : Mh;
@@ -3285,6 +3299,35 @@ public static class VsdxParser
         return true;
     }
 
+    /// <summary>
+    /// 判断实例子形状的几何是否只是母版几何的原样拷贝：所有坐标单元格都标了 F="Inh"。
+    /// 这种拷贝不携带母版段级 NoShow/NoFill/NoLine，若直接按它渲染会把隐藏的变体段
+    /// 也画出来（电路图放大器/电阻的多余线条）。只要有一个坐标单元格是自有值
+    /// （无 F 或 F 非 Inh），就认为实例真正改写了几何，仍按实例几何渲染。
+    /// </summary>
+    private static bool IsInheritedGeometryCopy(XElement instGeom)
+    {
+        bool sawCoord = false;
+        foreach (var sec in instGeom.Elements().Where(e =>
+                     e.Name.LocalName == "Section" &&
+                     ((string?)e.Attribute("N") ?? "").StartsWith("Geometry", StringComparison.Ordinal)))
+        {
+            foreach (var row in sec.Elements().Where(e => e.Name.LocalName == "Row"))
+            {
+                foreach (var cell in row.Elements().Where(e => e.Name.LocalName == "Cell"))
+                {
+                    var n = (string?)cell.Attribute("N");
+                    if (n is not ("X" or "Y" or "A" or "B" or "C" or "D" or "E")) continue;
+                    var f = (string?)cell.Attribute("F");
+                    if (f == null || !string.Equals(f.Trim(), "Inh", StringComparison.OrdinalIgnoreCase))
+                        return false;
+                    sawCoord = true;
+                }
+            }
+        }
+        return sawCoord;
+    }
+
     /// <summary>在母版几何区中查找同 (T, IX) 的行。</summary>
     private static XElement? FindMasterRow(XElement? msec, XElement row)
     {
@@ -3546,10 +3589,14 @@ public static class VsdxParser
         st.FillTrans = GetDimNullable(shape, "FillForegndTrans", inh) ?? StyleDim(fillStyle, "FillForegndTrans");
         st.LineTrans = GetDimNullable(shape, "LineColorTrans", inh) ?? StyleDim(lineStyle, "LineColorTrans");
         st.GradientAngle = GetDim(shape, "FillGradientAngle", null, Math.PI / 2);
-        // 渐变填充：色标在 FillGradient 段，FillGradientEnabled=1 时启用。
-        // 池背景（ms_diagrams）就是这种：FillPattern=0 但 FillGradientEnabled=1。
-        if (CellInt(shape, "FillGradientEnabled") == 1)
-            st.GradientStops = ReadGradient(shape, inh);
+        // 渐变填充：色标在 FillGradient 段。多数文件用 FillGradientEnabled=1 显式开启
+        //（池背景 ms_diagrams 就是 FillPattern=0 + Enabled=1）。但有些模板（aspose_sample
+        // 标题块两侧的浅蓝弧线）不写该单元格、只保留 FillGradient 段，Visio 仍按渐变绘制；
+        // 若只认 Enabled=1 会退回白色实心，浅色渐变块在白底上完全看不见。
+        var gradEnabled = CellInt(shape, "FillGradientEnabled");
+        var gradStops = ReadGradient(shape, inh);
+        if (gradEnabled == 1 || (gradEnabled == null && gradStops != null))
+            st.GradientStops = gradStops;
         // 文字样式沿 TextStyle 链回退：形状没有 Character 段时也要取到颜色/字号
         //（aspose 脑图 Topic 节点无 Character，蓝色在母版 TextStyle=30 里；
         // 旧实现只在有 Character 段时读样式链，这些节点文字全部掉成黑色）。
