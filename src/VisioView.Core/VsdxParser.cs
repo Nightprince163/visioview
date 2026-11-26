@@ -2445,18 +2445,84 @@ public static class VsdxParser
                     case "EllipticalArcTo":
                     {
                         // Visio/ECMA-376 官方语义：A/B 是「弧上的一个点」（通常在弧中点附近），
-                        // 不是贝塞尔控制点、也不是切线交点或半径；C 是长轴角度，D 是长短轴比。
-                        // 旧实现直接把 A/B 当二次贝塞尔控制点，但 Q 曲线并不经过控制点：
-                        //   Q(0.5) = (P0 + 2C + P1)/4  —— 弧顶只到 A/B 相对弦中点偏移的一半。
-                        // 于是 Visio 内置 Ellipse 母版（两段对称椭圆弧拼成的梭形）被压成扁片：
-                        // rdf_sample 的 Alice/BOB 参考宽高比 ~3.4，旧版渲染 ~7。
-                        // 正确做法：让二次贝塞尔「经过」A/B 这个弧中点 M，控制点取 M 关于弦中点的对称点：
-                        //   Q(0.5) = M  =>  C = 2M - (P0+P1)/2
-                        // 这对两段对称弧都能精确还原顶点（上弧顶=M、下弧底=M），梭形恢复饱满。
+                        // C 是长轴角度，D 是长短轴比。只让一条二次贝塞尔经过弧中点是不够的：
+                        // 二次曲线在两端点的切线由控制点位置决定，与相邻直边接不上（切线不连续），
+                        // 战略经营管理的开始/结束胶囊因此被画成带斜切角的八边形。
+                        // 正确做法：用「两端点 + 弧上一点 + 长轴角 + 轴比」重建真椭圆，
+                        // 再按 ≤90° 分段转成三次贝塞尔（切线连续，胶囊两端恢复成正圆弧）。
                         double ex = RowDim(row, "X", shape, curX, mrow, inh);
                         double ey = RowDim(row, "Y", shape, curY, mrow, inh);
                         double midX = RowDim(row, "A", shape, curX, mrow, inh);
                         double midY = RowDim(row, "B", shape, curY, mrow, inh);
+                        // C/D 不是长度，且公式常见 Width/Height*0.9 这类除法；EvalFormula 只支持
+                        // 「名字*常数」的部分匹配，会把 Height*0.9 误当成整个公式（office_plan
+                        // 的 D=1.02 被算成 13.48，重建出上万英寸的假椭圆）。这类公式直接用缓存 V。
+                        double ArcCell(string name, double def)
+                        {
+                            var cell = row.Elements().FirstOrDefault(c =>
+                                c.Name.LocalName == "Cell" && (string?)c.Attribute("N") == name);
+                            cell ??= mrow?.Elements().FirstOrDefault(c =>
+                                c.Name.LocalName == "Cell" && (string?)c.Attribute("N") == name);
+                            var f = (string?)cell?.Attribute("F");
+                            if (f != null && f.Contains('/'))
+                            {
+                                var v = (string?)cell!.Attribute("V");
+                                if (v != null && double.TryParse(v, NF, CultureInfo.InvariantCulture, out var dv))
+                                    return dv;
+                            }
+                            return RowDim(row, name, shape, def, mrow, inh);
+                        }
+                        double axisAngle = ArcCell("C", 0);
+                        double ratio = ArcCell("D", 1);
+                        if (ratio <= 1e-6) ratio = 1;
+                        bool fitted = TryFitEllipticalArc(curX, curY, ex, ey, midX, midY, axisAngle, ratio,
+                                                out var ecx, out var ecy, out var erx, out var ery,
+                                                out var th0, out var sweep);
+                        if (Trace)
+                            Console.Error.WriteLine($"  [earc] ID={shape.Attribute("ID")?.Value} " +
+                                $"w={GetDim(shape, "Width", inh, 0):0.###} h={GetDim(shape, "Height", inh, 0):0.###} " +
+                                $"p0=({curX:0.###},{curY:0.###}) p1=({ex:0.###},{ey:0.###}) m=({midX:0.###},{midY:0.###}) " +
+                                $"C={axisAngle:0.####} D={ratio:0.####} " +
+                                (fitted ? $"a={erx:0.###} b={ery:0.###} sw={sweep:0.###}" : "fit=fail"));
+                        if (fitted)
+                        {
+                            double ca = Math.Cos(axisAngle), sa = Math.Sin(axisAngle);
+                            // 椭圆参数点/导数先在「长轴坐标系」里算，再旋回形状本地坐标。
+                            void EllipsePoint(double th, out double lx, out double ly)
+                            {
+                                double u = ecx + erx * Math.Cos(th);
+                                double v = ecy + ery * Math.Sin(th);
+                                lx = u * ca - v * sa;
+                                ly = u * sa + v * ca;
+                            }
+                            void EllipseDeriv(double th, out double lx, out double ly)
+                            {
+                                double du = -erx * Math.Sin(th);
+                                double dv = ery * Math.Cos(th);
+                                lx = du * ca - dv * sa;
+                                ly = du * sa + dv * ca;
+                            }
+                            int segs = Math.Max(1, (int)Math.Ceiling(Math.Abs(sweep) / (Math.PI / 2)));
+                            for (int seg = 0; seg < segs; seg++)
+                            {
+                                double ta = th0 + sweep * seg / segs;
+                                double tb = th0 + sweep * (seg + 1) / segs;
+                                double alpha = 4.0 / 3.0 * Math.Tan((tb - ta) / 4);
+                                EllipsePoint(ta, out var p0x, out var p0y);
+                                EllipsePoint(tb, out var p3x, out var p3y);
+                                EllipseDeriv(ta, out var d0x, out var d0y);
+                                EllipseDeriv(tb, out var d3x, out var d3y);
+                                double c1x = p0x + alpha * d0x, c1y = p0y + alpha * d0y;
+                                double c2x = p3x - alpha * d3x, c2y = p3y - alpha * d3y;
+                                ProjectScreen(c1x, c1y, out var qc1x, out var qc1y);
+                                ProjectScreen(c2x, c2y, out var qc2x, out var qc2y);
+                                ToScreen(p3x, p3y, out var qp3x, out var qp3y);
+                                path.Commands.Add(new _Cubic(qc1x, qc1y, qc2x, qc2y, qp3x, qp3y));
+                            }
+                            curX = ex; curY = ey;
+                            break;
+                        }
+                        // 退化（三点共线、轴比异常等）时退回旧的过弧中点二次曲线。
                         double ctrlX = 2 * midX - (curX + ex) / 2;
                         double ctrlY = 2 * midY - (curY + ey) / 2;
                         ProjectScreen(ctrlX, ctrlY, out var qx, out var qy);
@@ -2642,6 +2708,70 @@ public static class VsdxParser
     }
 
     /// <summary>
+    /// 由 Visio 的 EllipticalArcTo 参数重建椭圆弧（形状本地坐标）。
+    /// 官方语义：A/B 是弧上的一个点，C 是长轴与 x 轴夹角（弧度），D 是长轴/短轴比。
+    /// 三点在椭圆上 + 轴角 + 轴比 → 唯一确定椭圆；返回长轴坐标系下的圆心、半轴、
+    /// 起点参数角与扫掠角（带符号，弧会经过 A/B 那个点）。
+    /// </summary>
+    private static bool TryFitEllipticalArc(
+        double x0, double y0, double x1, double y1, double mx, double my,
+        double axisAngle, double ratio,
+        out double cx, out double cy, out double rx, out double ry,
+        out double startAngle, out double sweep)
+    {
+        cx = cy = rx = ry = startAngle = sweep = 0;
+        double cos = Math.Cos(axisAngle), sin = Math.Sin(axisAngle);
+        static double U(double x, double y, double c, double s) => x * c + y * s;
+        static double V(double x, double y, double c, double s) => -x * s + y * c;
+
+        double u0 = U(x0, y0, cos, sin), v0 = V(x0, y0, cos, sin);
+        double u1 = U(x1, y1, cos, sin), v1 = V(x1, y1, cos, sin);
+        double u2 = U(mx, my, cos, sin), v2 = V(mx, my, cos, sin);
+        double d2 = ratio * ratio;
+
+        // 椭圆方程 (u-cu)² + D²(v-cv)² = a²，三点代入后两两相减得到 2×2 线性方程组。
+        double a11 = 2 * (u1 - u0), a12 = 2 * d2 * (v1 - v0);
+        double a21 = 2 * (u2 - u0), a22 = 2 * d2 * (v2 - v0);
+        double b1 = (u1 * u1 - u0 * u0) + d2 * (v1 * v1 - v0 * v0);
+        double b2 = (u2 * u2 - u0 * u0) + d2 * (v2 * v2 - v0 * v0);
+        double det = a11 * a22 - a12 * a21;
+        if (Math.Abs(det) < 1e-12) return false;
+        double cu = (b1 * a22 - a12 * b2) / det;
+        double cv = (a11 * b2 - b1 * a21) / det;
+        double e = u0 * u0 + d2 * v0 * v0 - 2 * u0 * cu - 2 * d2 * v0 * cv;
+        double a2 = e + cu * cu + d2 * cv * cv;
+        if (a2 <= 1e-12) return false;
+        double ax = Math.Sqrt(a2);
+        double by = ax / ratio;
+        if (by <= 1e-12) return false;
+        // 安全阀：弧的半径远大过弦长说明三点/轴比给不出可信椭圆（例如 D 被算错），
+        // 继续画会得到绕行整圈的巨大圆弧，把页面撑爆。此时交给调用方退回旧画法。
+        double chord = Math.Sqrt((x1 - x0) * (x1 - x0) + (y1 - y0) * (y1 - y0));
+        if (chord < 1e-9 || Math.Max(ax, by) > chord * 25) return false;
+
+        static double AngleOf(double u, double v, double cu, double cv, double ax, double by)
+            => Math.Atan2((v - cv) / by, (u - cu) / ax);
+        static double Norm(double a)
+        {
+            while (a <= -Math.PI) a += 2 * Math.PI;
+            while (a > Math.PI) a -= 2 * Math.PI;
+            return a;
+        }
+        double t0 = AngleOf(u0, v0, cu, cv, ax, by);
+        double tm = AngleOf(u2, v2, cu, cv, ax, by);
+        double t1 = AngleOf(u1, v1, cu, cv, ax, by);
+        // 分别取两段有符号增量（弧上点在中间），合起来就是经过 A/B 的扫掠角。
+        double sw = Norm(tm - t0) + Norm(t1 - tm);
+        if (Math.Abs(sw) < 1e-6 || Math.Abs(sw) > 2 * Math.PI + 1e-6) return false;
+        // Visio 图形里的椭圆弧几乎都是 ≤180°（半圆/胶囊端头/圆角）。超过半圈说明
+        // 弧上点被理解到了「另一侧」，会把形画成绕远路的巨弧；交给旧画法更安全。
+        if (Math.Abs(sw) > Math.PI + 0.01) return false;
+
+        cx = cu; cy = cv; rx = ax; ry = by; startAngle = t0; sweep = sw;
+        return true;
+    }
+
+    /// <summary>
     /// 渲染文字。ownM 是「该形状本地坐标 → 页面坐标」的变换矩阵，
     /// 锚点用 TxtPin（本地坐标，缺省为 Width/2, Height/2）。
     /// 注意：不能用 parentM 再叠加 Pin——那会把 Pin 平移算两遍，文字被顶到页面上方（曾偏移约 9in）。
@@ -2720,9 +2850,9 @@ public static class VsdxParser
         var td = new TextDrawable
         {
             Text = text,
-            // 没有显式文字色时按底色明暗自动取黑/白：
+            // 没有显式文字色时按底色明暗自动取黑/白（半透明底色按与白纸混色后的亮度算）：
             // 泳道表头是深藏青底，Visio 的「Themed」文字在那里显示为白色。
-            Color = style.TextColor ?? ThemedTextColor(style.FillForegnd),
+            Color = style.TextColor ?? ThemedTextColor(style.FillForegnd, style.FillTrans),
             FontSize = style.CharSize.HasValue ? style.CharSize.Value : 0.1667,
             CenterX = sx,
             CenterY = sy,
@@ -2901,12 +3031,28 @@ public static class VsdxParser
         return false;
     }
 
-    /// <summary>按底色明暗选对比色：深底用白字、浅底用黑字。</summary>
-    private static string ContrastTextColor(string? fill)
+    /// <summary>按底色明暗选对比色：深底用白字、浅底用黑字。
+    /// fillTrans 是 Visio 的透明度（0=不透明、1=全透明）：半透明色条会与白纸混成浅色，
+    /// 必须按混色后的亮度判断。db_schema 左下角图例就是 70% 透明的色条，
+    /// 直接拿未混色的纯绿/纯蓝算亮度会把本该黑色的标签判成白字。</summary>
+    private static string ContrastTextColor(string? fill, double? fillTrans = null)
     {
         if (string.IsNullOrEmpty(fill)) return "#000000";
-        try { return Luminance(fill!) < 120 ? "#FEFFFF" : "#000000"; }
+        try { return Luminance(BlendWithWhite(fill!, fillTrans)) < 120 ? "#FEFFFF" : "#000000"; }
         catch { return "#000000"; }
+    }
+
+    /// <summary>把底色按透明度叠到白纸上，得到肉眼看到的背景色。</summary>
+    private static string BlendWithWhite(string hex, double? fillTrans)
+    {
+        if (hex.Length != 7 || !fillTrans.HasValue || fillTrans.Value <= 0) return hex;
+        double t = Math.Clamp(fillTrans.Value, 0, 1);
+        int Blend(int i)
+        {
+            int c = Convert.ToInt32(hex.Substring(i, 2), 16);
+            return (int)Math.Round(c * (1 - t) + 255 * t);
+        }
+        return $"#{Blend(1):X2}{Blend(3):X2}{Blend(5):X2}";
     }
 
     /// <summary>「Themed」文字色：有明确底色时按对比取黑/白；
@@ -2914,9 +3060,9 @@ public static class VsdxParser
     /// 早期对浅底也套 accent1，导致 network_topology 的 Legend 标题与数据行
     /// 变成主题红色 #C05046（参考图是黑色）。orgchart 的 "Executive Staff"
     /// 恰好是无底色文字块，仍能取到主题蓝色。</summary>
-    private static string ThemedTextColor(string? fill)
+    private static string ThemedTextColor(string? fill, double? fillTrans = null)
     {
-        var c = ContrastTextColor(fill);
+        var c = ContrastTextColor(fill, fillTrans);
         if (fill != null) return c;
         return ThemeAccent1 ?? c;
     }
